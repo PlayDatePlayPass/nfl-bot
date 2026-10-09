@@ -6,9 +6,11 @@
       PlayDatePlayPass/nfl-bot). The workflow fetches
       https://www.nbcsports.com/fantasy/football/player-news (the "All News" view, first 3
       pages), parses it with scripts/fetch_news.py, fetches each listed player's /news page
-      for their history (headlines only, never analysis), and force-pushes a single commit
-      with news.json to the "data" branch. Schedule: every 10 min for the first hour after
-      launch, then hourly; manual runs any time.
+      for their history (headlines only, never analysis), MERGES the fresh posts into the
+      previous news.json (dedupe by player URL + timestamp + headline, items older than
+      7 days dropped, history kept only for players still in the window), and force-pushes a
+      single commit with news.json to the "data" branch (skipped when nothing changed).
+      Schedule: every 10 min for the first hour after launch, then hourly; manual runs any time.
       The app reads https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json
       (?t= cache-buster; raw sends Access-Control-Allow-Origin: *). If that fails it tries
       the GitHub contents API for the same file (unauthenticated, 60 requests/hour per IP).
@@ -19,10 +21,18 @@
   The parser reads NBC's "PlayerNewsPost" markup (here and in scripts/fetch_news.py),
   so if NBC changes its layout, update both.
   Data rules: only items with a valid timestamp are shown (list and player modal).
-  The list only shows items newer than the last successful refresh, stored in
-  localStorage ("nflbot.lastRefresh"). For the feed this is the feed's fetchedAt time
-  (so posts that land between feed updates aren't skipped). First load shows everything.
-  Demo data never advances the stored refresh time.
+  Rolling 7-day list: every roster-move / designation item from the last 7 days is shown,
+  newest first, and a refresh never empties it. Each successful feed or live load is merged
+  into a localStorage cache ("nflbot.cache"), deduped by player URL (or name) + timestamp +
+  headline and pruned to 7 days, so posts that roll off NBC's page or a failed fetch don't
+  shrink the list. If every source fails, the cached list is shown; the DEMO set is used
+  only when there's no cache, and demo data is never written to the cache.
+  NEW tag: items with a timestamp newer than the previous successful refresh, stored in
+  localStorage ("nflbot.lastRefresh"), are tagged NEW. For the feed that time is the
+  feed's fetchedAt (so posts that land between feed updates aren't missed); for the live
+  proxy fetch it's the load time. It only advances after a successful feed/live load,
+  never for cache or demo. First load (no stored time): nothing is tagged.
+  Storage errors (private mode, quota) are ignored quietly.
 -->
 <html lang="en">
 <head>
@@ -71,6 +81,9 @@
   .who .tm{color:var(--muted);font-weight:500;font-size:14px;margin-left:4px}
   .hl{margin-top:2px}
   .when{color:var(--muted);font-size:13px;margin-top:4px;font-variant-numeric:tabular-nums}
+  li.item.is-new{border-color:#2b4f86}
+  .new{display:inline-block;vertical-align:2px;margin-left:8px;padding:1px 6px;border-radius:6px;background:rgba(59,130,246,.18);
+    border:1px solid var(--accent);color:#93c5fd;font-size:11px;font-weight:700;letter-spacing:.06em;line-height:1.4}
   .empty{color:var(--muted);text-align:center;padding:40px 16px}
   .empty strong{display:block;color:var(--text);font-weight:600;margin-bottom:4px}
   /* modal */
@@ -132,6 +145,9 @@ const FEED_URLS = [
   () => "https://api.github.com/repos/PlayDatePlayPass/nfl-bot/contents/news.json?ref=data&t=" + Date.now()
 ];
 const LAST_KEY = "nflbot.lastRefresh";
+const CACHE_KEY = "nflbot.cache";      // rolling list of real (never demo) items: {v:1, items:[...]}
+const KEEP_MS = 7 * 86400e3;           // 7-day window
+const FIELDS = ["name","team","pos","headline","type","date","newsUrl"];
 
 // Keywords that mark roster moves vs. injury/designation news. Headlines only; analysis is never shown.
 const MOVE_RE = /\b(trade[ds]?|acquire[ds]?|sign(?:s|ed)?|re-sign(?:s|ed)?|release[ds]?|waive[ds]?|claim(?:s|ed)?|cut|practice squad|elevate[ds]?|promote[ds]?|activate[ds]?|reinstate[ds]?|suspend(?:s|ed)?|suspension|retire[ds]?|designated? to return|placed? on|PUP|NFI)\b/i;
@@ -151,12 +167,23 @@ const DEMO_HISTORY = [
   {headline:"Example: placed on IR.",type:"Injury",date:new Date(Date.now()-20*60e3).toISOString()}
 ];
 
-let items = [], filter = "all", isDemo = false, prevRefresh = null, feed = null; // feed = last good JSON feed (has .history)
+let items = [], filter = "all", isDemo = false, prevRefresh = null, feed = null, newCount = 0; // feed = last good JSON feed (has .history)
 const $ = s => document.querySelector(s);
 
 // localStorage can throw (private mode, storage disabled): fail soft.
 function readLast(){ try{ const v = Number(localStorage.getItem(LAST_KEY)); return v > 0 ? v : null; }catch(e){ return null; } }
 function writeLast(ms){ try{ localStorage.setItem(LAST_KEY, String(ms)); }catch(e){} }
+function readCache(){
+  try{ const d = JSON.parse(localStorage.getItem(CACHE_KEY) || "null"); return d && Array.isArray(d.items) ? d.items : []; }catch(e){ return []; }
+}
+function writeCache(list){
+  const slim = list.map(i => { const o = {}; for (const f of FIELDS) o[f] = i[f] || ""; return o; });
+  // On quota errors, retry with the newest half until it fits (or give up quietly).
+  for (let n = slim.length; ; n = Math.floor(n / 2)){
+    try{ localStorage.setItem(CACHE_KEY, JSON.stringify({v:1, items: slim.slice(0, n)})); return; }
+    catch(e){ if (n <= 1) return; }
+  }
+}
 
 async function fetchHtml(url){
   let lastErr;
@@ -219,6 +246,16 @@ function stamp(arr){
   return out;
 }
 
+// Stable identity: player (news URL, else name) + instant + headline.
+const keyOf = i => (i.newsUrl || i.name || "") + "|" + i.t + "|" + i.headline;
+
+// Merge lists (later lists win on duplicates), keep the last 7 days, newest first.
+function mergeWindow(...lists){
+  const m = new Map(), cutoff = Date.now() - KEEP_MS;
+  for (const l of lists) for (const i of l) if (i.t >= cutoff) m.set(keyOf(i), i);
+  return [...m.values()].sort((a,b) => b.t - a.t || (keyOf(a) < keyOf(b) ? 1 : -1));
+}
+
 function kind(it){
   if (MOVE_RE.test(it.headline) && !/\b(questionable|doubtful|limited|practice\b(?! squad))/i.test(it.headline)) return "move";
   if (/injury/i.test(it.type) || INJ_RE.test(it.headline)) return "injury";
@@ -231,9 +268,8 @@ const when = ms => Number.isFinite(ms) ? FMT.format(ms) : "";
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 function emptyHtml(){
-  if (items.length) return '<li class="empty">Nothing in this filter since your last refresh.</li>';
-  if (!isDemo && prevRefresh) return `<li class="empty"><strong>Nothing new since your last refresh</strong>Last refresh: ${esc(when(prevRefresh))}</li>`;
-  return '<li class="empty">No roster moves or designation changes right now.</li>';
+  if (items.length) return '<li class="empty">Nothing in this filter from the last 7 days.</li>';
+  return '<li class="empty">No roster moves or designation changes in the last 7 days.</li>';
 }
 
 function render(){
@@ -241,10 +277,10 @@ function render(){
   const shown = filter === "all" ? items : items.filter(i => i.k === filter);
   if(!shown.length){ list.innerHTML = emptyHtml(); return; }
   list.innerHTML = shown.map(i => `
-    <li class="item" data-i="${i.idx}" tabindex="0">
+    <li class="item${i.isNew?" is-new":""}" data-i="${i.idx}" tabindex="0">
       <span class="dot ${i.k==="injury"?"injury":""}"></span>
       <div class="body">
-        <div class="who">${esc(i.name)}<span class="tm">${esc([i.team,i.pos].filter(Boolean).join(" · "))}</span></div>
+        <div class="who">${esc(i.name)}<span class="tm">${esc([i.team,i.pos].filter(Boolean).join(" · "))}</span>${i.isNew?'<span class="new">NEW</span>':""}</div>
         <div class="hl">${esc(i.headline)}</div>
         <div class="when">${esc(when(i.t))}</div>
       </div>
@@ -257,36 +293,45 @@ function load(){ return loading || (loading = doLoad().finally(() => { loading =
 async function doLoad(){
   const btn = $("#refresh"), st = $("#status");
   btn.disabled = true; st.className = ""; st.textContent = "Loading latest from NBC Sports…";
-  let raw, asOf = null;
+  let raw = null, asOf = null, live = false;
   try{
-    feed = await fetchFeed(); raw = feed.items; asOf = Date.parse(feed.fetchedAt); isDemo = false;
+    feed = await fetchFeed(); raw = feed.items; asOf = Date.parse(feed.fetchedAt); live = true;
   }catch(e){
     feed = null;
-    try{
-      raw = parsePosts(await fetchHtml(SOURCE)); isDemo = false; // secondary: live via CORS proxies
-    }catch(e2){
-      raw = DEMO.slice(); isDemo = true;
-    }
+    try{ raw = parsePosts(await fetchHtml(SOURCE)); live = true; }catch(e2){} // secondary: live via CORS proxies
   }
-  let list = stamp(raw).map(i => ({...i, k: kind(i)})).filter(i => i.k);
+  const prep = arr => stamp(arr).map(i => ({...i, k: kind(i)})).filter(i => i.k);
   const now = Date.now();
-  if (isDemo){
-    // Demo is never filtered by, and never advances, the stored refresh time.
-    prevRefresh = readLast();
-    st.className = "demo";
-    st.textContent = "DEMO DATA (made-up examples). Couldn't reach NBC Sports. Tap Refresh to try again.";
-  } else {
-    prevRefresh = readLast();
-    if (prevRefresh) list = list.filter(i => i.t > prevRefresh);
+  const cached = prep(readCache());
+  let list;
+  prevRefresh = readLast(); // previous successful refresh: anything newer gets the NEW tag
+  if (live){
+    isDemo = false;
+    list = mergeWindow(cached, prep(raw)); // fresh copies win; the list never shrinks below the 7-day cache
+    writeCache(list);
     // Feed: mark "seen up to" the feed's own fetch time (never moves backwards). Proxy: now.
     const mark = asOf ? Math.min(asOf, now) : now;
     if (!prevRefresh || mark > prevRefresh) writeLast(mark);
-    st.textContent = asOf
-      ? "Live from NBC Sports · data as of " + when(asOf) + (prevRefresh ? " · new since " + when(prevRefresh) : "")
-      : "Live from NBC Sports (direct) · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) +
-        (prevRefresh ? " · new since " + when(prevRefresh) : "");
+  } else if (cached.length){
+    isDemo = false;
+    list = mergeWindow(cached); // every source failed: show the saved 7-day list, don't touch the refresh time
+  } else {
+    isDemo = true;
+    list = prep(DEMO.slice()); // demo: never cached, never tagged, never advances the refresh time
   }
-  items = list.sort((a,b) => b.t - a.t).map((i, idx) => ({...i, idx}));
+  items = list.map((i, idx) => ({...i, idx, isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
+  newCount = items.filter(i => i.isNew).length;
+  const tail = " · " + newCount + " new" + (prevRefresh ? "" : " (first visit)");
+  if (isDemo){
+    st.className = "demo";
+    st.textContent = "DEMO DATA (made-up examples). Couldn't reach NBC Sports. Tap Refresh to try again.";
+  } else if (!live){
+    st.textContent = "Couldn't reach NBC Sports · showing saved news from the last 7 days" + tail + " · tap Refresh to retry";
+  } else {
+    st.textContent = asOf
+      ? "Live from NBC Sports · data as of " + when(asOf) + tail
+      : "Live from NBC Sports (direct) · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) + tail;
+  }
   render(); btn.disabled = false;
 }
 

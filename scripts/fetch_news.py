@@ -8,6 +8,13 @@ For each listed player, their /news page is fetched to build a de-duplicated
 history. A previous news.json (if given) is reused so unchanged players aren't
 re-fetched every run.
 
+Rolling window: each run MERGES the fresh posts into the previous news.json's
+items (dedupe key = newsUrl or name + timestamp + headline; the fresh copy wins),
+drops anything older than KEEP_DAYS, and sorts newest first (ties broken by key,
+so unchanged input gives byte-identical output and the workflow's
+"skip publish if unchanged" check still works). history keeps only players that
+still have an item in the window, capped at MAX_HISTORY entries each.
+
 Usage: fetch_news.py OUT.json [PREV.json]
 Exit code 3 = nothing parsed (blocked / layout change); the workflow then fails
 loudly instead of publishing an empty feed.
@@ -18,6 +25,8 @@ SOURCE = "https://www.nbcsports.com/fantasy/football/player-news"
 PAGES = 3            # 10 posts per page
 DELAY = 1.0          # seconds between requests to NBC
 MAX_HISTORY = 25     # per player
+KEEP_DAYS = 7        # rolling window for items
+MAX_ITEMS = 3000     # safety cap on the merged list
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/129.0 Safari/537.36")
 
@@ -43,12 +52,21 @@ def attr(chunk, cls, name):
     a = re.search(r'\b%s="([^"]*)"' % re.escape(name), m.group(0))
     return html.unescape(a.group(1)) if a else ""
 
-def valid_date(s):
+def parse_date(s):
     try:
-        d = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return d.year >= 2000
+        d = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if d.tzinfo is None: d = d.replace(tzinfo=datetime.timezone.utc)
+        return d if d.year >= 2000 else None
     except Exception:
-        return False
+        return None
+
+def valid_date(s): return parse_date(s) is not None
+
+def item_key(it):
+    # Stable identity for the rolling list: player (news URL, else name) + instant + headline.
+    d = parse_date(it.get("date"))
+    return "|".join((it.get("newsUrl") or it.get("name") or "",
+                     d.isoformat() if d else str(it.get("date")), it.get("headline") or ""))
 
 def parse_posts(page):
     out = []
@@ -100,11 +118,27 @@ def main():
     if not items:
         print("No posts parsed; NBC may be blocking this runner or changed its markup.", errors)
         sys.exit(3)
-    items.sort(key=lambda x: x["date"], reverse=True)
+    fresh = items
+
+    # Merge into the previous rolling list, then prune to the last KEEP_DAYS.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=KEEP_DAYS)
+    prev_items = prev.get("items", []) if isinstance(prev, dict) else []
+    merged = {}
+    for it in (prev_items if isinstance(prev_items, list) else []):
+        if isinstance(it, dict) and it.get("headline") and valid_date(it.get("date")):
+            merged[item_key(it)] = {k: it.get(k, "") for k in ("name", "team", "pos", "headline", "type", "date", "newsUrl")}
+    carried = len(merged)
+    for it in fresh:
+        merged[item_key(it)] = it                       # fresh copy wins
+    items = [it for it in merged.values() if parse_date(it["date"]) >= cutoff]
+    items.sort(key=lambda x: (parse_date(x["date"]), item_key(x)), reverse=True)
+    items = items[:MAX_ITEMS]
+    print(f"merge: {len(fresh)} fresh + {carried} previous -> {len(items)} within {KEEP_DAYS} days")
 
     history, fetched, reused = {}, 0, 0
     for url in dict.fromkeys(i["newsUrl"] for i in items if i["newsUrl"]):
-        latest = {key(i) for i in items if i["newsUrl"] == url}
+        latest = {key(i) for i in fresh if i["newsUrl"] == url}
         old = prev_hist.get(url)
         if old and latest <= {key(h) for h in old}:
             history[url] = old; reused += 1; continue   # nothing new for this player
@@ -115,7 +149,7 @@ def main():
             print("history ERROR", url, e); errors.append(f"{url}: {e}")
             hist = old or []
         hist += [{"headline": i["headline"], "type": i["type"], "date": i["date"]}
-                 for i in items if i["newsUrl"] == url]           # make sure the listed item is included
+                 for i in fresh if i["newsUrl"] == url]           # make sure the listed item is included
         dedup = {}
         for h in hist: dedup.setdefault(key(h), h)
         history[url] = sorted(dedup.values(), key=lambda h: h["date"], reverse=True)[:MAX_HISTORY]
@@ -130,7 +164,7 @@ def main():
     if errors: feed["errors"] = errors[:20]
     with open(out_path, "w") as f:
         json.dump(feed, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"{len(items)} items, {len(history)} players (fetched {fetched}, reused {reused}), {len(errors)} errors")
+    print(f"{len(items)} items ({len(fresh)} fresh), {len(history)} players (fetched {fetched}, reused {reused}), {len(errors)} errors")
 
 if __name__ == "__main__":
     main()
