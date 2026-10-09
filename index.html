@@ -1,0 +1,365 @@
+<!doctype html>
+<!--
+  NFL Bot: single-file app (all CSS and JS inline, no libraries).
+  Data source: https://www.nbcsports.com/fantasy/football/player-news
+  CORS: NBC Sports doesn't allow direct browser fetches, so this file tries a
+  direct fetch first, then public CORS proxies (api.allorigins.win, then corsproxy.io).
+  Those proxies are third-party services and can be slow or down.
+  Demo fallback: if every fetch fails, it shows a clearly labeled DEMO dataset
+  (made-up example items, not real news). To use live data, just open the file with
+  internet access. The parser reads NBC's "PlayerNewsPost" markup, so if NBC
+  changes its page layout, update parsePosts() below.
+  Data rules: only items with a valid timestamp are shown (list and player modal).
+  The list only shows items newer than the last successful live refresh, which is
+  stored in localStorage ("nflbot.lastRefresh"). First load shows everything.
+  Demo data never advances the stored refresh time.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0b0d10">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<title>NFL Bot</title>
+<style>
+  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#f59e0b;--move:#22c55e;
+        --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px);--sar:env(safe-area-inset-right,0px);color-scheme:dark}
+  *{box-sizing:border-box}
+  /* overscroll-behavior on the root scroller stops Chrome's own pull-to-refresh and glow from fighting ours */
+  html{overscroll-behavior-y:none;-webkit-text-size-adjust:100%;text-size-adjust:100%;background:var(--bg)}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font:16px/1.4 system-ui,Roboto,"Google Sans Text",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased}
+  body{overscroll-behavior-y:none;min-height:100vh;min-height:100dvh}
+  button,li.item{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);
+    padding:calc(var(--sat) + 12px) calc(var(--sar) + 16px) 12px calc(var(--sal) + 16px);display:flex;align-items:center;gap:12px}
+  h1{font-size:20px;margin:0;flex:1}
+  button{font:inherit;color:inherit}
+  #refresh{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:600;min-height:44px}
+  #refresh:active{filter:brightness(.88)}
+  #refresh:disabled{opacity:.5}
+  main{will-change:auto}
+  main.pulling{will-change:transform}
+  main.anim,#ptr.anim{transition:transform .2s ease}
+  #status{padding:8px calc(var(--sar) + 16px) 8px calc(var(--sal) + 16px);color:var(--muted);font-size:13px}
+  #status.demo{color:#fbbf24;font-weight:600}
+  .filters{display:flex;gap:8px;padding:0 calc(var(--sar) + 16px) 8px calc(var(--sal) + 16px);overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none}
+  .filters::-webkit-scrollbar{display:none}
+  .chip{border:1px solid var(--line);background:transparent;border-radius:999px;padding:6px 12px;font-size:14px;white-space:nowrap;min-height:36px}
+  .chip.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+  ul#list{list-style:none;margin:0;padding:0 calc(var(--sar) + 12px) calc(var(--sab) + 24px) calc(var(--sal) + 12px)}
+  li.item{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;cursor:pointer;
+    content-visibility:auto;contain-intrinsic-size:auto 96px}
+  li.item:active{border-color:var(--accent);background:#1a2029}
+  .dot{flex:0 0 10px;height:10px;border-radius:50%;margin-top:7px;background:var(--move)}
+  .dot.injury{background:var(--inj)}
+  .body{flex:1;min-width:0;overflow-wrap:anywhere}
+  .who{font-weight:700}
+  .who .tm{color:var(--muted);font-weight:500;font-size:14px;margin-left:4px}
+  .hl{margin-top:2px}
+  .when{color:var(--muted);font-size:13px;margin-top:4px;font-variant-numeric:tabular-nums}
+  .empty{color:var(--muted);text-align:center;padding:40px 16px}
+  .empty strong{display:block;color:var(--text);font-weight:600;margin-bottom:4px}
+  /* modal */
+  #modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;justify-content:center;z-index:10;overscroll-behavior:contain}
+  #modal.open{display:flex}
+  .sheet{background:var(--card);width:100%;max-width:640px;max-height:85vh;max-height:85dvh;border-radius:16px 16px 0 0;border:1px solid var(--line);border-bottom:0;
+    display:flex;flex-direction:column;padding-bottom:var(--sab)}
+  .sheet header{position:static;border-bottom:1px solid var(--line);padding:14px calc(var(--sar) + 16px) 14px calc(var(--sal) + 16px)}
+  .sheet h2{margin:0;font-size:18px;flex:1}
+  #close{background:transparent;border:1px solid var(--line);border-radius:10px;min-width:44px;min-height:44px;font-size:18px}
+  .sheet .content{overflow-y:auto;overscroll-behavior:contain;padding:12px calc(var(--sar) + 16px) 20px calc(var(--sal) + 16px)}
+  .sheet h3{font-size:14px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:16px 0 6px}
+  .sheet ol{margin:0;padding-left:18px}
+  .sheet li{margin:6px 0}
+  .sheet .d{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+  .sheet a{color:var(--accent)}
+  body.modal-open{overflow:hidden}
+  /* pull to refresh: a fixed indicator moved with transform only (no layout work per frame) */
+  #ptr{position:fixed;left:0;right:0;top:0;z-index:4;height:56px;display:flex;align-items:center;justify-content:center;gap:8px;
+    color:var(--muted);font-size:14px;pointer-events:none;transform:translateY(-60px);opacity:0}
+  #ptr .spin{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%}
+  #ptr.loading .spin{animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion: reduce){main.anim,#ptr.anim{transition:none}#ptr.loading .spin{animation-duration:2s}}
+</style>
+</head>
+<body>
+<header id="top">
+  <h1>NFL Bot</h1>
+  <button id="refresh" type="button">Refresh</button>
+</header>
+<div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
+<main id="content">
+  <div id="status">Loading…</div>
+  <div class="filters" id="filters">
+    <button class="chip on" data-f="all" type="button">All</button>
+    <button class="chip" data-f="move" type="button">Roster moves</button>
+    <button class="chip" data-f="injury" type="button">Injuries / designations</button>
+  </div>
+  <ul id="list"></ul>
+</main>
+
+<div id="modal" role="dialog" aria-modal="true" aria-labelledby="mtitle">
+  <div class="sheet">
+    <header><h2 id="mtitle">Player</h2><button id="close" type="button" aria-label="Close">✕</button></header>
+    <div class="content" id="mbody"></div>
+  </div>
+</div>
+
+<script>
+const SOURCE = "https://www.nbcsports.com/fantasy/football/player-news"; // no filter param = the site's "All News" view (not Headline/Injury/Recap/Transaction)
+const PROXIES = [
+  u => u, // direct (usually blocked by CORS)
+  u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  u => "https://corsproxy.io/?url=" + encodeURIComponent(u)
+];
+const LAST_KEY = "nflbot.lastRefresh";
+
+// Keywords that mark roster moves vs. injury/designation news. Headlines only; analysis is never shown.
+const MOVE_RE = /\b(trade[ds]?|acquire[ds]?|sign(?:s|ed)?|re-sign(?:s|ed)?|release[ds]?|waive[ds]?|claim(?:s|ed)?|cut|practice squad|elevate[ds]?|promote[ds]?|activate[ds]?|reinstate[ds]?|suspend(?:s|ed)?|suspension|retire[ds]?|designated? to return|placed? on|PUP|NFI)\b/i;
+const INJ_RE = /\b(injur\w*|IR|questionable|doubtful|ruled out|out for|inactive|active for|limited|did not practice|does not practice|DNP|full(?:y)? practic\w*|practicing|concussion|protocol|hamstring|ankle|knee|groin|calf|shoulder|toe|ribs?|back|foot|thumb|illness|\(\w+\))\b/i;
+
+// DEMO dataset: made-up example items, NOT real news. Used only when live fetching fails.
+const DEMO = [
+  {name:"Example Player A",team:"NYJ",pos:"WR",headline:"Example Player A (hamstring) placed on IR.",type:"Injury",date:new Date(Date.now()-20*60e3).toISOString(),newsUrl:""},
+  {name:"Example Player B",team:"DAL",pos:"RB",headline:"Cowboys signed Example Player B to the active roster.",type:"Transaction",date:new Date(Date.now()-65*60e3).toISOString(),newsUrl:""},
+  {name:"Example Player C",team:"KC",pos:"TE",headline:"Example Player C (ankle) listed as questionable for Sunday.",type:"Injury",date:new Date(Date.now()-3*3600e3).toISOString(),newsUrl:""},
+  {name:"Example Player D",team:"SF",pos:"CB",headline:"49ers waived Example Player D.",type:"Transaction",date:new Date(Date.now()-5*3600e3).toISOString(),newsUrl:""},
+  {name:"Example Player E",team:"BUF",pos:"LB",headline:"Bills traded Example Player E to the Bears for a 2027 sixth-round pick.",type:"Transaction",date:new Date(Date.now()-9*3600e3).toISOString(),newsUrl:""}
+];
+const DEMO_HISTORY = [
+  {headline:"Example: limited in practice (hamstring).",type:"Injury",date:new Date(Date.now()-3*86400e3).toISOString()},
+  {headline:"Example: did not practice (hamstring).",type:"Injury",date:new Date(Date.now()-2*86400e3).toISOString()},
+  {headline:"Example: placed on IR.",type:"Injury",date:new Date(Date.now()-20*60e3).toISOString()}
+];
+
+let items = [], filter = "all", isDemo = false, prevRefresh = null;
+const $ = s => document.querySelector(s);
+
+// localStorage can throw (private mode, storage disabled): fail soft.
+function readLast(){ try{ const v = Number(localStorage.getItem(LAST_KEY)); return v > 0 ? v : null; }catch(e){ return null; } }
+function writeLast(ms){ try{ localStorage.setItem(LAST_KEY, String(ms)); }catch(e){} }
+
+async function fetchHtml(url){
+  let lastErr;
+  for (const p of PROXIES){
+    try{
+      const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort(), 12000);
+      const r = await fetch(p(url), {signal: ctl.signal, cache: "no-store"}); clearTimeout(t);
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      const txt = await r.text();
+      if (txt.includes("PlayerNewsPost")) return txt;
+      throw new Error("No news markup");
+    }catch(e){ lastErr = e; }
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
+const txt = el => el ? el.textContent.replace(/\s+/g," ").trim() : "";
+
+function parsePosts(html){
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return [...doc.querySelectorAll(".PlayerNewsPost")].map(p => ({
+    name: [txt(p.querySelector(".PlayerNewsPost-firstName")), txt(p.querySelector(".PlayerNewsPost-lastName"))].filter(Boolean).join(" ") || txt(p.querySelector(".PlayerNewsPost-name")),
+    team: txt(p.querySelector(".PlayerNewsPost-team-abbr")),
+    pos: txt(p.querySelector(".PlayerNewsPost-position")),
+    headline: txt(p.querySelector(".PlayerNewsPost-headline")),
+    type: txt(p.querySelector(".PlayerNewsPost-type")),
+    date: (p.querySelector(".PlayerNewsPost-date")||{}).getAttribute?.("data-date") || "",
+    newsUrl: (p.querySelector(".PlayerNewsPost-moreNewsLink")||{}).getAttribute?.("href") || "",
+    sourceUrl: (p.querySelector(".PlayerNewsPost-source a")||{}).getAttribute?.("href") || ""
+  })).filter(x => x.headline);
+}
+
+// Valid timestamp = parses to a real date. Anything else is dropped everywhere.
+// Adds a numeric .t (ms) so sorting/filtering never re-parses strings.
+function stamp(arr){
+  const out = [];
+  for (const it of arr){
+    const t = it.date ? Date.parse(it.date) : NaN;
+    if (Number.isFinite(t) && t > 946684800000) out.push({...it, t}); // after 2000-01-01
+  }
+  return out;
+}
+
+function kind(it){
+  if (MOVE_RE.test(it.headline) && !/\b(questionable|doubtful|limited|practice\b(?! squad))/i.test(it.headline)) return "move";
+  if (/injury/i.test(it.type) || INJ_RE.test(it.headline)) return "injury";
+  if (/transaction|signing|trade|roster/i.test(it.type)) return "move";
+  return null; // pure analysis or other news: skipped
+}
+
+const FMT = new Intl.DateTimeFormat(undefined,{month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
+const when = ms => Number.isFinite(ms) ? FMT.format(ms) : "";
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function emptyHtml(){
+  if (items.length) return '<li class="empty">Nothing in this filter since your last refresh.</li>';
+  if (!isDemo && prevRefresh) return `<li class="empty"><strong>Nothing new since your last refresh</strong>Last refresh: ${esc(when(prevRefresh))}</li>`;
+  return '<li class="empty">No roster moves or designation changes right now.</li>';
+}
+
+function render(){
+  const list = $("#list");
+  const shown = filter === "all" ? items : items.filter(i => i.k === filter);
+  if(!shown.length){ list.innerHTML = emptyHtml(); return; }
+  list.innerHTML = shown.map(i => `
+    <li class="item" data-i="${i.idx}" tabindex="0">
+      <span class="dot ${i.k==="injury"?"injury":""}"></span>
+      <div class="body">
+        <div class="who">${esc(i.name)}<span class="tm">${esc([i.team,i.pos].filter(Boolean).join(" · "))}</span></div>
+        <div class="hl">${esc(i.headline)}</div>
+        <div class="when">${esc(when(i.t))}</div>
+      </div>
+    </li>`).join("");
+}
+
+let loading = null;
+function load(){ return loading || (loading = doLoad().finally(() => { loading = null; })); }
+
+async function doLoad(){
+  const btn = $("#refresh"), st = $("#status");
+  btn.disabled = true; st.className = ""; st.textContent = "Loading latest from NBC Sports…";
+  let raw;
+  try{
+    raw = parsePosts(await fetchHtml(SOURCE)); isDemo = false;
+  }catch(e){
+    raw = DEMO.slice(); isDemo = true;
+  }
+  let list = stamp(raw).map(i => ({...i, k: kind(i)})).filter(i => i.k);
+  const now = Date.now();
+  if (isDemo){
+    // Demo is never filtered by, and never advances, the stored refresh time.
+    prevRefresh = readLast();
+    st.className = "demo";
+    st.textContent = "DEMO DATA (made-up examples). Couldn't reach NBC Sports. Tap Refresh to try again.";
+  } else {
+    prevRefresh = readLast();
+    if (prevRefresh) list = list.filter(i => i.t > prevRefresh);
+    writeLast(now);
+    st.textContent = "Live from NBC Sports · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) +
+      (prevRefresh ? " · new since " + when(prevRefresh) : "");
+  }
+  items = list.sort((a,b) => b.t - a.t).map((i, idx) => ({...i, idx}));
+  render(); btn.disabled = false;
+}
+
+// Modal. Android back button closes it via a history entry.
+let modalHist = false;
+function closeModal(fromPop){
+  if (!$("#modal").classList.contains("open")) return;
+  $("#modal").classList.remove("open"); document.body.classList.remove("modal-open");
+  if (modalHist && !fromPop){ modalHist = false; history.back(); } else modalHist = false;
+}
+window.addEventListener("popstate", () => closeModal(true));
+
+let openToken = 0;
+async function openPlayer(it){
+  const token = ++openToken;
+  $("#mtitle").textContent = it.name + (it.team ? " · " + it.team : "");
+  const body = $("#mbody");
+  const latest = `<h3>Latest</h3><p>${esc(it.headline)}<br><span class="d">${esc(when(it.t))}</span></p>`;
+  body.innerHTML = latest + `<p class="d">Loading player history…</p>`;
+  body.scrollTop = 0;
+  if (!$("#modal").classList.contains("open")){
+    $("#modal").classList.add("open"); document.body.classList.add("modal-open");
+    try{ history.pushState({nflModal:1}, ""); modalHist = true; }catch(e){}
+  }
+  let hist = [];
+  try{
+    if (isDemo || !it.newsUrl) throw new Error("no url");
+    hist = parsePosts(await fetchHtml(it.newsUrl));
+  }catch(e){ hist = isDemo ? DEMO_HISTORY : []; }
+  if (token !== openToken) return; // a newer modal replaced this one
+  hist = stamp(hist).sort((a,b) => b.t - a.t);
+  const inj = hist.filter(h => kind(h)==="injury");
+  const recent = hist.filter(h => kind(h)).slice(0,10);
+  const li = arr => arr.length ? "<ol>" + arr.map(h => `<li>${esc(h.headline)}<br><span class="d">${esc(when(h.t))}</span></li>`).join("") + "</ol>" : '<p class="d">Nothing listed on the source.</p>';
+  body.innerHTML = latest +
+    `<h3>Injury history${isDemo?" (demo)":""}</h3>` + li(inj) +
+    `<h3>Recent moves &amp; designations${isDemo?" (demo)":""}</h3>` + li(recent) +
+    (it.newsUrl ? `<p><a href="${esc(it.newsUrl)}" target="_blank" rel="noopener">All news on NBC Sports</a></p>` : "");
+}
+
+$("#refresh").addEventListener("click", () => load());
+$("#filters").addEventListener("click", e => {
+  const b = e.target.closest(".chip"); if(!b) return;
+  document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c===b));
+  filter = b.dataset.f; render();
+});
+$("#list").addEventListener("click", e => {
+  const li = e.target.closest("li.item"); if(li) openPlayer(items[+li.dataset.i]);
+});
+$("#list").addEventListener("keydown", e => {
+  if(e.key==="Enter"){ const li = e.target.closest("li.item"); if(li) openPlayer(items[+li.dataset.i]); }
+});
+$("#close").addEventListener("click", () => closeModal());
+$("#modal").addEventListener("click", e => { if(e.target.id==="modal") closeModal(); });
+document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); });
+
+// Pull to refresh: drag down from the top of the page to reload.
+// Only transform/opacity change per frame (compositor-only), updates are rAF-throttled,
+// and the non-passive touchmove listener exists only while a pull is possible,
+// so normal scrolling stays fully passive.
+(() => {
+  const ptr = $("#ptr"), label = $("#ptrText"), spin = ptr.querySelector(".spin"), main = $("#content");
+  const THRESHOLD = 70, MAX = 110, REST = 50;
+  let startY = null, startX = 0, dist = 0, busy = false, raf = 0, armed = false, decided = false;
+  const topOffset = () => $("#top").offsetHeight;
+  const paint = () => {
+    raf = 0;
+    const y = dist;
+    main.style.transform = y ? `translate3d(0,${y}px,0)` : "";
+    ptr.style.transform = `translate3d(0,${topOffset() - 56 + y}px,0)`;
+    ptr.style.opacity = y ? Math.min(1, y / THRESHOLD) : 0;
+    if (!ptr.classList.contains("loading")) spin.style.transform = "rotate(" + (y * 4) + "deg)";
+  };
+  const set = d => { dist = d; if (!raf) raf = requestAnimationFrame(paint); };
+  const setAnim = on => { main.classList.toggle("anim", on); ptr.classList.toggle("anim", on); };
+
+  function onMove(e){
+    if (startY === null) return;
+    const t = e.touches[0], dy = t.clientY - startY, dx = t.clientX - startX;
+    if (!decided){
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      decided = true;
+      if (Math.abs(dx) > Math.abs(dy) || dy < 0 || window.scrollY > 0){ end(false); return; } // horizontal or upward: let the browser scroll
+      main.classList.add("pulling");
+    }
+    if (dy <= 0){ set(0); return; }
+    if (e.cancelable) e.preventDefault();
+    const d = Math.min(MAX, dy * 0.5);
+    const was = dist >= THRESHOLD;
+    set(d);
+    if ((d >= THRESHOLD) !== was) label.textContent = d >= THRESHOLD ? "Release to refresh" : "Pull to refresh";
+  }
+  function disarm(){ if (armed){ window.removeEventListener("touchmove", onMove); armed = false; } }
+  async function end(trigger){
+    disarm();
+    startY = null; decided = false; setAnim(true);
+    if (trigger && dist >= THRESHOLD && !$("#refresh").disabled){
+      busy = true; ptr.classList.add("loading"); spin.style.transform = ""; label.textContent = "Refreshing…"; set(REST);
+      await load();
+      ptr.classList.remove("loading"); busy = false;
+    }
+    label.textContent = "Pull to refresh";
+    set(0);
+    setTimeout(() => main.classList.remove("pulling"), 220);
+  }
+  window.addEventListener("touchstart", e => {
+    if (busy || window.scrollY > 0 || e.touches.length > 1 || $("#modal").classList.contains("open") || e.target.closest(".filters")) { startY = null; return; }
+    startY = e.touches[0].clientY; startX = e.touches[0].clientX; dist = 0; decided = false; setAnim(false);
+    if (!armed){ window.addEventListener("touchmove", onMove, {passive: false}); armed = true; }
+  }, {passive: true});
+  window.addEventListener("touchend", () => { if (startY !== null) end(true); }, {passive: true});
+  window.addEventListener("touchcancel", () => { if (startY !== null) end(false); }, {passive: true});
+  paint();
+})();
+
+load();
+</script>
+</body>
+</html>
