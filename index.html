@@ -1,17 +1,27 @@
 <!doctype html>
 <!--
   NFL Bot: single-file app (all CSS and JS inline, no libraries).
-  Data source: https://www.nbcsports.com/fantasy/football/player-news
-  CORS: NBC Sports doesn't allow direct browser fetches, so this file tries a
-  direct fetch first, then public CORS proxies (api.allorigins.win, then corsproxy.io).
-  Those proxies are third-party services and can be slow or down.
-  Demo fallback: if every fetch fails, it shows a clearly labeled DEMO dataset
-  (made-up example items, not real news). To use live data, just open the file with
-  internet access. The parser reads NBC's "PlayerNewsPost" markup, so if NBC
-  changes its page layout, update parsePosts() below.
+  Data path (in order):
+   1. JSON feed built by GitHub Actions (.github/workflows/fetch-news.yml in
+      PlayDatePlayPass/nfl-bot). The workflow fetches
+      https://www.nbcsports.com/fantasy/football/player-news (the "All News" view, first 3
+      pages), parses it with scripts/fetch_news.py, fetches each listed player's /news page
+      for their history (headlines only, never analysis), and force-pushes a single commit
+      with news.json to the "data" branch. Schedule: every 10 min for the first hour after
+      launch, then hourly; manual runs any time.
+      The app reads https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json
+      (?t= cache-buster; raw sends Access-Control-Allow-Origin: *). If that fails it tries
+      the GitHub contents API for the same file (unauthenticated, 60 requests/hour per IP).
+      The player modal uses the feed's per-player history.
+   2. Fallback: live fetch of the NBC page through public CORS proxies
+      (api.allorigins.win, then corsproxy.io). These third-party services are often down.
+   3. Last resort: a clearly labeled DEMO dataset (made-up examples, not real news).
+  The parser reads NBC's "PlayerNewsPost" markup (here and in scripts/fetch_news.py),
+  so if NBC changes its layout, update both.
   Data rules: only items with a valid timestamp are shown (list and player modal).
-  The list only shows items newer than the last successful live refresh, which is
-  stored in localStorage ("nflbot.lastRefresh"). First load shows everything.
+  The list only shows items newer than the last successful refresh, stored in
+  localStorage ("nflbot.lastRefresh"). For the feed this is the feed's fetchedAt time
+  (so posts that land between feed updates aren't skipped). First load shows everything.
   Demo data never advances the stored refresh time.
 -->
 <html lang="en">
@@ -116,6 +126,10 @@ const PROXIES = [
   u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
   u => "https://corsproxy.io/?url=" + encodeURIComponent(u)
 ];
+const FEED_URLS = [
+  () => "https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json?t=" + Date.now(),
+  () => "https://api.github.com/repos/PlayDatePlayPass/nfl-bot/contents/news.json?ref=data&t=" + Date.now()
+];
 const LAST_KEY = "nflbot.lastRefresh";
 
 // Keywords that mark roster moves vs. injury/designation news. Headlines only; analysis is never shown.
@@ -136,7 +150,7 @@ const DEMO_HISTORY = [
   {headline:"Example: placed on IR.",type:"Injury",date:new Date(Date.now()-20*60e3).toISOString()}
 ];
 
-let items = [], filter = "all", isDemo = false, prevRefresh = null;
+let items = [], filter = "all", isDemo = false, prevRefresh = null, feed = null; // feed = last good JSON feed (has .history)
 const $ = s => document.querySelector(s);
 
 // localStorage can throw (private mode, storage disabled): fail soft.
@@ -156,6 +170,25 @@ async function fetchHtml(url){
     }catch(e){ lastErr = e; }
   }
   throw lastErr || new Error("fetch failed");
+}
+
+// JSON feed from the GitHub Actions workflow. Returns {fetchedAt, items, history}.
+async function fetchFeed(){
+  let lastErr;
+  for (const u of FEED_URLS){
+    try{
+      const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort(), 10000);
+      const url = u();
+      const r = await fetch(url, {signal: ctl.signal, cache: "no-store",
+        headers: url.includes("api.github.com") ? {Accept: "application/vnd.github.raw+json"} : {}});
+      clearTimeout(t);
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json();
+      if (!d || !Array.isArray(d.items) || !d.items.length || !Number.isFinite(Date.parse(d.fetchedAt))) throw new Error("bad feed");
+      return d;
+    }catch(e){ lastErr = e; }
+  }
+  throw lastErr || new Error("feed failed");
 }
 
 const txt = el => el ? el.textContent.replace(/\s+/g," ").trim() : "";
@@ -223,11 +256,16 @@ function load(){ return loading || (loading = doLoad().finally(() => { loading =
 async function doLoad(){
   const btn = $("#refresh"), st = $("#status");
   btn.disabled = true; st.className = ""; st.textContent = "Loading latest from NBC Sports…";
-  let raw;
+  let raw, asOf = null;
   try{
-    raw = parsePosts(await fetchHtml(SOURCE)); isDemo = false;
+    feed = await fetchFeed(); raw = feed.items; asOf = Date.parse(feed.fetchedAt); isDemo = false;
   }catch(e){
-    raw = DEMO.slice(); isDemo = true;
+    feed = null;
+    try{
+      raw = parsePosts(await fetchHtml(SOURCE)); isDemo = false; // secondary: live via CORS proxies
+    }catch(e2){
+      raw = DEMO.slice(); isDemo = true;
+    }
   }
   let list = stamp(raw).map(i => ({...i, k: kind(i)})).filter(i => i.k);
   const now = Date.now();
@@ -239,9 +277,13 @@ async function doLoad(){
   } else {
     prevRefresh = readLast();
     if (prevRefresh) list = list.filter(i => i.t > prevRefresh);
-    writeLast(now);
-    st.textContent = "Live from NBC Sports · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) +
-      (prevRefresh ? " · new since " + when(prevRefresh) : "");
+    // Feed: mark "seen up to" the feed's own fetch time (never moves backwards). Proxy: now.
+    const mark = asOf ? Math.min(asOf, now) : now;
+    if (!prevRefresh || mark > prevRefresh) writeLast(mark);
+    st.textContent = asOf
+      ? "Live from NBC Sports · data as of " + when(asOf) + (prevRefresh ? " · new since " + when(prevRefresh) : "")
+      : "Live from NBC Sports (direct) · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) +
+        (prevRefresh ? " · new since " + when(prevRefresh) : "");
   }
   items = list.sort((a,b) => b.t - a.t).map((i, idx) => ({...i, idx}));
   render(); btn.disabled = false;
@@ -271,7 +313,8 @@ async function openPlayer(it){
   let hist = [];
   try{
     if (isDemo || !it.newsUrl) throw new Error("no url");
-    hist = parsePosts(await fetchHtml(it.newsUrl));
+    if (feed && feed.history && Array.isArray(feed.history[it.newsUrl])) hist = feed.history[it.newsUrl];
+    else hist = parsePosts(await fetchHtml(it.newsUrl));
   }catch(e){ hist = isDemo ? DEMO_HISTORY : []; }
   if (token !== openToken) return; // a newer modal replaced this one
   hist = stamp(hist).sort((a,b) => b.t - a.t);

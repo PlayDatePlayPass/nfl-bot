@@ -1,0 +1,84 @@
+name: Fetch NBC news
+
+# Schedule: every 10 min until FAST_UNTIL (UTC) = first successful live run + 1 hour,
+# then hourly (the '7 * * * *' cron). Manual workflow_dispatch runs always fetch.
+# GitHub may delay or skip scheduled runs under load.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+env:
+  FAST_UNTIL: '2026-10-09T03:10:00Z'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-news
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Gate (10-min cron only runs before FAST_UNTIL)
+        id: gate
+        run: |
+          now=$(date -u +%s); cutoff=$(date -u -d "$FAST_UNTIL" +%s)
+          run=true
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "*/10 * * * *" ] && [ "$now" -ge "$cutoff" ]; then
+            run=false
+          fi
+          echo "event=${{ github.event_name }} schedule='${{ github.event.schedule }}' now=$(date -u +%FT%TZ) cutoff=$FAST_UNTIL run=$run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Get previous feed from the data branch
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if git fetch --depth=1 origin data; then
+            git show FETCH_HEAD:news.json > prev.json || echo '{}' > prev.json
+          else
+            echo '{}' > prev.json
+          fi
+
+      - name: Fetch and parse NBC Sports player news
+        if: steps.gate.outputs.run == 'true'
+        run: python3 scripts/fetch_news.py news.json prev.json
+
+      - name: Decide whether to publish
+        if: steps.gate.outputs.run == 'true'
+        id: diff
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          new = json.load(open("news.json"))
+          try: old = json.load(open("prev.json"))
+          except Exception: old = {}
+          strip = lambda d: {k: d.get(k) for k in ("items", "history")}
+          changed = strip(new) != strip(old)
+          stale = True
+          try:
+              age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(old["fetchedAt"].replace("Z", "+00:00"))
+              stale = age.total_seconds() > 3000   # ~hourly heartbeat so "data as of" never looks dead
+          except Exception: pass
+          publish = changed or stale
+          print(f"changed={changed} stale={stale} publish={publish}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f: f.write(f"publish={'true' if publish else 'false'}\n")
+          PY
+
+      - name: Force-push a single orphan commit to the data branch
+        if: steps.gate.outputs.run == 'true' && steps.diff.outputs.publish == 'true'
+        run: |
+          mkdir out && cp news.json out/ && cd out
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add news.json
+          git commit -q -m "news.json $(python3 -c 'import json;print(json.load(open("news.json"))["fetchedAt"])')"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data:data
