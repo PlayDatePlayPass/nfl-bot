@@ -1,6 +1,6 @@
 name: Fetch NBC news
 
-# Schedule: every 10 min until FAST_UNTIL (UTC) = first successful live run + 1 hour,
+# Schedule: every 10 min until FAST_UNTIL (UTC) = first successful live run (2026-10-09T02:00:14Z) + 1 hour,
 # then hourly (the '7 * * * *' cron). Manual workflow_dispatch runs always fetch.
 # GitHub may delay or skip scheduled runs under load.
 on:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 env:
-  FAST_UNTIL: '2026-10-09T03:10:00Z'
+  FAST_UNTIL: '2026-10-09T03:00:14Z'
 
 permissions:
   contents: write
