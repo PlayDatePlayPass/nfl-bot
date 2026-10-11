@@ -41,7 +41,7 @@
   label from statusLabel() (DNP, Limited, Full, Questionable, Doubtful, Out, IR, Activated,
   Designated to return, Inactive, Cleared, Signed, Released, Traded, Suspended, Unclear, ...),
   day/time in ET, headline in small text. A one-line trend ("Limited → Questionable → Out", up to 6
-  labels, consecutive repeats collapsed) sits on top. None: "No status changes this week". It
+  labels, consecutive repeats collapsed, "Unclear" left out unless that is all there is) sits on top. None: "No status changes this week". It
   renders immediately from list items, then again once history loads. The old "Recent moves &
   designations" section was removed (same data as the timeline); "Injury history" stays (longer range).
   Commentary: hidden by default. Tapping (or Enter on) a list item expands it inline to show
@@ -558,7 +558,7 @@ function timelineHtml(it, hist){
   for (const h of m.values()){ const c = h.c !== undefined ? h.c : color(h); if (c && c !== "grey") rows.push({h, c, l: statusLabel(h, c)}); }
   rows.sort((a, b) => a.h.t - b.h.t);
   if (!rows.length) return '<h3>Status timeline</h3><p class="d">No status changes this week</p>';
-  const trend = rows.map(r => r.l).filter((l, i, a) => l !== a[i - 1]).slice(-6);
+  const firm = rows.filter(r => r.l !== "Unclear"), trend = (firm.length ? firm : rows).map(r => r.l).filter((l, i, a) => l !== a[i - 1]).slice(-6);
   return `<h3>Status timeline</h3><div class="trend">${esc(trend.join(" → "))}</div><ol class="tl">` +
     rows.map(r => `<li><span class="td ${r.c}"></span><span class="lb">${esc(r.l)}</span><span class="tw">${esc(FMT_ET.format(r.h.t))} ET</span><div class="th">${esc(r.h.headline)}</div></li>`).join("") + "</ol>";
 }
