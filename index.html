@@ -6,10 +6,12 @@
       PlayDatePlayPass/nfl-bot). The workflow fetches
       https://www.nbcsports.com/fantasy/football/player-news (the "All News" view, first 3
       pages), parses it with scripts/fetch_news.py, fetches each listed player's /news page
-      for their history (headlines only, never analysis), MERGES the fresh posts into the
+      for their history, captures NBC's commentary (.PlayerNewsPost-analysis, author credit dropped)
+      as an "analysis" field on items and history entries, MERGES the fresh posts into the
       previous news.json (dedupe by player URL + timestamp + headline, items older than
       7 days dropped, history kept only for players still in the window), and force-pushes a
       single commit with news.json to the "data" branch (skipped when nothing changed).
+      The fresh copy wins the merge, so older items without "analysis" are backfilled when re-fetched.
       Schedule: every 10 min for the first hour after launch, then hourly; manual runs any time.
       The app reads https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json
       (?t= cache-buster; raw sends Access-Control-Allow-Origin: *). If that fails it tries
@@ -32,7 +34,25 @@
   feed's fetchedAt (so posts that land between feed updates aren't missed); for the live
   proxy fetch it's the load time. It only advances after a successful feed/live load,
   never for cache or demo. First load (no stored time): nothing is tagged.
-  Storage errors (private mode, quota) are ignored quietly.
+  Commentary: hidden by default. Tapping (or Enter on) a list item expands it inline to show
+  the analysis ("No commentary" if none) plus a "Player history" button that opens the player
+  modal; tapping again collapses. Expanding only toggles a class and appends one node (no layout
+  reads); expanded items switch content-visibility to visible. The modal shows the same
+  commentary under "Latest" behind a "Show commentary" toggle.
+  Read/unread: each item's id is the cache dedupe key (keyOf). An item is read when tapped /
+  expanded, or scrolled past: >=60% visible for ~1s, or its bottom leaves above the viewport top
+  (IntersectionObserver only, no scroll handlers). Unread rows get an orange dot (#f97316) on the
+  right; the left category marker is a thin bar (green = move, yellow = injury) so the two can't be
+  confused. Read ids live in localStorage ("nflbot.read": {v:1, ids:{id: itemTimeMs}}), pruned to
+  the 7-day window. First visit after this feature (no key yet): every current item is marked
+  read, so only later arrivals start unread. "Mark all read" + an unread count sit in the status
+  line. Demo items never read or write read state. NEW (since last refresh) is independent.
+  Team schedule: the team abbreviation (list row and modal title) links to ESPN's schedule,
+  https://www.espn.com/nfl/team/schedule/_/name/<espn abbr> (new tab, rel=noopener). NBC->ESPN
+  differences: WAS->wsh, JAC->jax, LA->lar (also accepts LAR/JAX/WSH/LVR/OAK/STL/SD aliases);
+  all 32 checked against ESPN's own team API. Unknown codes (e.g. FA) aren't linked. Tapping the
+  link never expands the item or marks it read.
+  Storage errors (private mode, quota) are ignored quietly. All feed text is HTML-escaped.
 -->
 <html lang="en">
 <head>
@@ -44,7 +64,7 @@
 <title>NFL Bot</title>
 <link rel="icon" href="data:,">
 <style>
-  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#f59e0b;--move:#22c55e;
+  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#facc15;--unread:#f97316;--move:#22c55e;
         --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px);--sar:env(safe-area-inset-right,0px);color-scheme:dark}
   *{box-sizing:border-box}
   /* overscroll-behavior on the root scroller stops Chrome's own pull-to-refresh and glow from fighting ours */
@@ -74,8 +94,20 @@
   li.item{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;cursor:pointer;
     content-visibility:auto;contain-intrinsic-size:auto 96px}
   li.item:active{border-color:var(--accent);background:#1a2029}
-  .dot{flex:0 0 10px;height:10px;border-radius:50%;margin-top:7px;background:var(--move)}
+  /* left category marker = thin bar; right unread marker = round orange dot */
+  .dot{flex:0 0 4px;align-self:stretch;min-height:20px;border-radius:2px;background:var(--move)}
   .dot.injury{background:var(--inj)}
+  .ur{flex:0 0 10px;height:10px;border-radius:50%;margin-top:6px;background:var(--unread);visibility:hidden}
+  li.item.unread .ur{visibility:visible}
+  li.item.open{content-visibility:visible;border-color:#3a4554}
+  .more{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);cursor:auto}
+  .cm{white-space:pre-line;color:#c9d1db;font-size:15px}
+  .cm.none{color:var(--muted);font-style:italic}
+  .hbtn{margin-top:8px;background:transparent;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;min-height:36px;color:var(--accent)}
+  a.tm-link{position:relative;color:inherit;text-decoration:underline;text-decoration-color:#4b5563;text-underline-offset:2px}
+  a.tm-link::after{content:"";position:absolute;inset:-14px -10px}  /* ~44px tap target without growing the row */
+  #status .mark{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:24px}
+  #status .uc{color:var(--unread);font-weight:600}
   .body{flex:1;min-width:0;overflow-wrap:anywhere}
   .who{font-weight:700}
   .who .tm{color:var(--muted);font-weight:500;font-size:14px;margin-left:4px}
@@ -100,6 +132,8 @@
   .sheet li{margin:6px 0}
   .sheet .d{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
   .sheet a{color:var(--accent)}
+  .sheet h2 a.tm-link{color:inherit}
+  .tog{background:none;border:0;padding:6px 0;color:var(--accent);font-size:14px;min-height:32px}
   body.modal-open{overflow:hidden}
   /* pull to refresh: a fixed indicator moved with transform only (no layout work per frame) */
   #ptr{position:fixed;left:0;right:0;top:0;z-index:4;height:56px;display:flex;align-items:center;justify-content:center;gap:8px;
@@ -117,7 +151,7 @@
 </header>
 <div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
 <main id="content">
-  <div id="status">Loading…</div>
+  <div id="status"><span id="stText">Loading…</span><span id="stRead"></span></div>
   <div class="filters" id="filters">
     <button class="chip on" data-f="all" type="button">All</button>
     <button class="chip" data-f="move" type="button">Roster moves</button>
@@ -147,9 +181,16 @@ const FEED_URLS = [
 const LAST_KEY = "nflbot.lastRefresh";
 const CACHE_KEY = "nflbot.cache";      // rolling list of real (never demo) items: {v:1, items:[...]}
 const KEEP_MS = 7 * 86400e3;           // 7-day window
-const FIELDS = ["name","team","pos","headline","type","date","newsUrl"];
+const READ_KEY = "nflbot.read";       // {v:1, ids:{itemId: itemTimeMs}}
+const FIELDS = ["name","team","pos","headline","analysis","type","date","newsUrl"];
+// NBC team code -> ESPN schedule slug (verified against site.api.espn.com team links).
+const ESPN = {ARI:"ari",ATL:"atl",BAL:"bal",BUF:"buf",CAR:"car",CHI:"chi",CIN:"cin",CLE:"cle",DAL:"dal",DEN:"den",
+  DET:"det",GB:"gb",HOU:"hou",IND:"ind",JAC:"jax",JAX:"jax",KC:"kc",LV:"lv",LVR:"lv",OAK:"lv",LAC:"lac",SD:"lac",
+  LA:"lar",LAR:"lar",STL:"lar",MIA:"mia",MIN:"min",NE:"ne",NO:"no",NYG:"nyg",NYJ:"nyj",PHI:"phi",PIT:"pit",
+  SF:"sf",SEA:"sea",TB:"tb",TEN:"ten",WAS:"wsh",WSH:"wsh"};
+const espnUrl = t => { const a = ESPN[String(t||"").toUpperCase()]; return a ? "https://www.espn.com/nfl/team/schedule/_/name/" + a : ""; };
 
-// Keywords that mark roster moves vs. injury/designation news. Headlines only; analysis is never shown.
+// Keywords that mark roster moves vs. injury/designation news (classification uses headlines only).
 const MOVE_RE = /\b(trade[ds]?|acquire[ds]?|sign(?:s|ed)?|re-sign(?:s|ed)?|release[ds]?|waive[ds]?|claim(?:s|ed)?|cut|practice squad|elevate[ds]?|promote[ds]?|activate[ds]?|reinstate[ds]?|suspend(?:s|ed)?|suspension|retire[ds]?|designated? to return|placed? on|PUP|NFI)\b/i;
 const INJ_RE = /\b(injur\w*|IR|questionable|doubtful|ruled out|out for|inactive|active for|limited|did not practice|does not practice|DNP|full(?:y)? practic\w*|practicing|concussion|protocol|hamstring|ankle|knee|groin|calf|shoulder|toe|ribs?|back|foot|thumb|illness|\(\w+\))\b/i;
 
@@ -184,6 +225,22 @@ function writeCache(list){
     catch(e){ if (n <= 1) return; }
   }
 }
+
+// Read state. readIds === null means "no key yet" (first visit after this feature).
+let readIds = null, readDirty = false, readTimer = 0;
+function loadRead(){
+  try{ const d = JSON.parse(localStorage.getItem(READ_KEY) || "null"); readIds = d && d.ids && typeof d.ids === "object" ? d.ids : null; }
+  catch(e){ readIds = null; }
+}
+function saveRead(){
+  readTimer = 0; if (!readDirty || !readIds) return; readDirty = false;
+  const cutoff = Date.now() - KEEP_MS;
+  for (const k in readIds) if (!(readIds[k] >= cutoff)) delete readIds[k];   // prune with the 7-day window
+  try{ localStorage.setItem(READ_KEY, JSON.stringify({v:1, ids: readIds})); }catch(e){}
+}
+const queueSave = () => { readDirty = true; if (!readTimer) readTimer = setTimeout(saveRead, 300); };
+window.addEventListener("pagehide", saveRead);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveRead(); });
 
 async function fetchHtml(url){
   let lastErr;
@@ -221,6 +278,13 @@ async function fetchFeed(){
 
 const txt = el => el ? el.textContent.replace(/\s+/g," ").trim() : "";
 
+function analysisText(el){
+  if (!el) return "";
+  const c = el.cloneNode(true);
+  c.querySelectorAll(".PlayerNewsPost-author").forEach(a => a.remove()); // "- Author" credit lives in its own div
+  return txt(c);
+}
+
 function parsePosts(html){
   const doc = new DOMParser().parseFromString(html, "text/html");
   return [...doc.querySelectorAll(".PlayerNewsPost")].map(p => ({
@@ -228,6 +292,7 @@ function parsePosts(html){
     team: txt(p.querySelector(".PlayerNewsPost-team-abbr")),
     pos: txt(p.querySelector(".PlayerNewsPost-position")),
     headline: txt(p.querySelector(".PlayerNewsPost-headline")),
+    analysis: analysisText(p.querySelector(".PlayerNewsPost-analysis")),
     type: txt(p.querySelector(".PlayerNewsPost-type")),
     date: (p.querySelector(".PlayerNewsPost-date")||{}).getAttribute?.("data-date") || "",
     newsUrl: (p.querySelector(".PlayerNewsPost-moreNewsLink")||{}).getAttribute?.("href") || "",
@@ -252,7 +317,10 @@ const keyOf = i => (i.newsUrl || i.name || "") + "|" + i.t + "|" + i.headline;
 // Merge lists (later lists win on duplicates), keep the last 7 days, newest first.
 function mergeWindow(...lists){
   const m = new Map(), cutoff = Date.now() - KEEP_MS;
-  for (const l of lists) for (const i of l) if (i.t >= cutoff) m.set(keyOf(i), i);
+  for (const l of lists) for (const i of l) if (i.t >= cutoff){
+    const k = keyOf(i), old = m.get(k);
+    m.set(k, old && old.analysis && !i.analysis ? {...i, analysis: old.analysis} : i);
+  }
   return [...m.values()].sort((a,b) => b.t - a.t || (keyOf(a) < keyOf(b) ? 1 : -1));
 }
 
@@ -272,19 +340,87 @@ function emptyHtml(){
   return '<li class="empty">No roster moves or designation changes in the last 7 days.</li>';
 }
 
+const teamHtml = team => {
+  const u = espnUrl(team);
+  return u ? `<a class="tm-link" href="${esc(u)}" target="_blank" rel="noopener" aria-label="${esc(team)} schedule on ESPN">${esc(team)}</a>` : esc(team);
+};
+const moreHtml = i => `<div class="more">${i.analysis ? `<div class="cm">${esc(i.analysis)}</div>` : '<div class="cm none">No commentary</div>'}`
+  + `<button class="hbtn" type="button">Player history</button></div>`;
+const isRead = i => isDemo || !readIds || !!readIds[i.id];
+const expanded = new Set(); // ids of expanded rows (survives re-render)
+
 function render(){
   const list = $("#list");
   const shown = filter === "all" ? items : items.filter(i => i.k === filter);
-  if(!shown.length){ list.innerHTML = emptyHtml(); return; }
-  list.innerHTML = shown.map(i => `
-    <li class="item${i.isNew?" is-new":""}" data-i="${i.idx}" tabindex="0">
+  if(!shown.length){ list.innerHTML = emptyHtml(); observeUnread(); return; }
+  list.innerHTML = shown.map(i => {
+    const open = expanded.has(i.id);
+    return `
+    <li class="item${i.isNew?" is-new":""}${isRead(i)?"":" unread"}${open?" open":""}" data-i="${i.idx}" data-id="${esc(i.id)}" tabindex="0" aria-expanded="${open}">
       <span class="dot ${i.k==="injury"?"injury":""}"></span>
       <div class="body">
-        <div class="who">${esc(i.name)}<span class="tm">${esc([i.team,i.pos].filter(Boolean).join(" · "))}</span>${i.isNew?'<span class="new">NEW</span>':""}</div>
+        <div class="who">${esc(i.name)}<span class="tm">${[i.team ? teamHtml(i.team) : "", esc(i.pos||"")].filter(Boolean).join(" · ")}</span>${i.isNew?'<span class="new">NEW</span>':""}</div>
         <div class="hl">${esc(i.headline)}</div>
-        <div class="when">${esc(when(i.t))}</div>
+        <div class="when">${esc(when(i.t))}</div>${open ? moreHtml(i) : ""}
       </div>
-    </li>`).join("");
+      <span class="ur" aria-label="unread"></span>
+    </li>`; }).join("");
+  observeUnread();
+}
+
+function unreadCount(){ return isDemo || !readIds ? 0 : items.reduce((n, i) => n + (readIds[i.id] ? 0 : 1), 0); }
+function renderReadStatus(){
+  const el = $("#stRead"), n = unreadCount();
+  if (isDemo || !readIds){ el.innerHTML = ""; return; }
+  el.innerHTML = ` · <span class="uc">${n} unread</span>` + (n ? ' <button class="mark" type="button" id="markAll">Mark all read</button>' : "");
+}
+function markRead(it, li){
+  if (!it || isDemo || !readIds || readIds[it.id]) return;
+  readIds[it.id] = it.t; queueSave();
+  li = li || document.querySelector(`li.item[data-i="${it.idx}"]`);
+  if (li){ li.classList.remove("unread"); if (io) io.unobserve(li); stopTimer(li); }
+  renderReadStatus();
+}
+function markAllRead(){
+  if (isDemo || !readIds) return;
+  for (const i of items) readIds[i.id] = i.t;
+  queueSave(); saveRead();
+  document.querySelectorAll("li.item.unread").forEach(li => li.classList.remove("unread"));
+  if (io) io.disconnect();
+  renderReadStatus();
+}
+
+// Scrolled-past detection: >=60% visible for 1s, or the row's bottom leaves above the viewport top.
+let io = null;
+const timers = new Map();
+function stopTimer(li){ const t = timers.get(li); if (t){ clearTimeout(t); timers.delete(li); } }
+function observeUnread(){
+  if (io) io.disconnect();
+  timers.forEach(clearTimeout); timers.clear();
+  if (isDemo || !readIds || !("IntersectionObserver" in window)) return;
+  const top = $("#top").offsetHeight; // sticky header hides the top of the viewport
+  io = new IntersectionObserver(entries => {
+    for (const e of entries){
+      const li = e.target, it = items[+li.dataset.i];
+      if (e.intersectionRatio >= 0.6){
+        if (!timers.has(li)) timers.set(li, setTimeout(() => { timers.delete(li); markRead(it, li); }, 1000));
+      } else {
+        stopTimer(li);
+        if (!e.isIntersecting && e.rootBounds && e.boundingClientRect.bottom <= e.rootBounds.top) markRead(it, li);
+      }
+    }
+  }, {rootMargin: `-${top}px 0px 0px 0px`, threshold: [0, 0.6]});
+  document.querySelectorAll("li.item.unread").forEach(li => io.observe(li));
+}
+
+function toggleItem(li){
+  const it = items[+li.dataset.i]; if (!it) return;
+  const open = !li.classList.contains("open");
+  li.classList.toggle("open", open); li.setAttribute("aria-expanded", open);
+  const body = li.querySelector(".body"), more = body.querySelector(".more");
+  if (open){ expanded.add(it.id); if (!more) body.insertAdjacentHTML("beforeend", moreHtml(it)); }
+  else { expanded.delete(it.id); if (more) more.remove(); }
+  markRead(it, li);
 }
 
 let loading = null;
@@ -292,7 +428,8 @@ function load(){ return loading || (loading = doLoad().finally(() => { loading =
 
 async function doLoad(){
   const btn = $("#refresh"), st = $("#status");
-  btn.disabled = true; st.className = ""; st.textContent = "Loading latest from NBC Sports…";
+  const stx = $("#stText");
+  btn.disabled = true; st.className = ""; stx.textContent = "Loading latest from NBC Sports…"; $("#stRead").innerHTML = "";
   let raw = null, asOf = null, live = false;
   try{
     feed = await fetchFeed(); raw = feed.items; asOf = Date.parse(feed.fetchedAt); live = true;
@@ -319,20 +456,25 @@ async function doLoad(){
     isDemo = true;
     list = prep(DEMO.slice()); // demo: never cached, never tagged, never advances the refresh time
   }
-  items = list.map((i, idx) => ({...i, idx, isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
+  items = list.map((i, idx) => ({...i, idx, id: keyOf(i), isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
+  if (!isDemo){
+    loadRead();
+    if (!readIds){ readIds = {}; for (const i of items) readIds[i.id] = i.t; queueSave(); saveRead(); } // first visit: all read
+  }
+  const ids = new Set(items.map(i => i.id)); for (const id of expanded) if (!ids.has(id)) expanded.delete(id);
   newCount = items.filter(i => i.isNew).length;
   const tail = " · " + newCount + " new" + (prevRefresh ? "" : " (first visit)");
   if (isDemo){
     st.className = "demo";
-    st.textContent = "DEMO DATA (made-up examples). Couldn't reach NBC Sports. Tap Refresh to try again.";
+    stx.textContent = "DEMO DATA (made-up examples). Couldn't reach NBC Sports. Tap Refresh to try again.";
   } else if (!live){
-    st.textContent = "Couldn't reach NBC Sports · showing saved news from the last 7 days" + tail + " · tap Refresh to retry";
+    stx.textContent = "Couldn't reach NBC Sports · showing saved news from the last 7 days" + tail + " · tap Refresh to retry";
   } else {
-    st.textContent = asOf
+    stx.textContent = asOf
       ? "Live from NBC Sports · data as of " + when(asOf) + tail
       : "Live from NBC Sports (direct) · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) + tail;
   }
-  render(); btn.disabled = false;
+  render(); renderReadStatus(); btn.disabled = false;
 }
 
 // Modal. Android back button closes it via a history entry.
@@ -347,9 +489,10 @@ window.addEventListener("popstate", () => closeModal(true));
 let openToken = 0;
 async function openPlayer(it){
   const token = ++openToken;
-  $("#mtitle").textContent = it.name + (it.team ? " · " + it.team : "");
+  $("#mtitle").innerHTML = esc(it.name) + (it.team ? " · " + teamHtml(it.team) : "");
   const body = $("#mbody");
-  const latest = `<h3>Latest</h3><p>${esc(it.headline)}<br><span class="d">${esc(when(it.t))}</span></p>`;
+  const latest = `<h3>Latest</h3><p>${esc(it.headline)}<br><span class="d">${esc(when(it.t))}</span></p>` +
+    (it.analysis ? `<button class="tog" type="button" aria-expanded="false">Show commentary</button><p class="cm" hidden>${esc(it.analysis)}</p>` : "");
   body.innerHTML = latest + `<p class="d">Loading player history…</p>`;
   body.scrollTop = 0;
   if (!$("#modal").classList.contains("open")){
@@ -367,11 +510,19 @@ async function openPlayer(it){
   const inj = hist.filter(h => kind(h)==="injury");
   const recent = hist.filter(h => kind(h)).slice(0,10);
   const li = arr => arr.length ? "<ol>" + arr.map(h => `<li>${esc(h.headline)}<br><span class="d">${esc(when(h.t))}</span></li>`).join("") + "</ol>" : '<p class="d">Nothing listed on the source.</p>';
+  const tg = body.querySelector(".tog"), wasOpen = tg && tg.getAttribute("aria-expanded") === "true";
   body.innerHTML = latest +
     `<h3>Injury history${isDemo?" (demo)":""}</h3>` + li(inj) +
     `<h3>Recent moves &amp; designations${isDemo?" (demo)":""}</h3>` + li(recent) +
     (it.newsUrl ? `<p><a href="${esc(it.newsUrl)}" target="_blank" rel="noopener">All news on NBC Sports</a></p>` : "");
+  if (wasOpen) setCommentary(true); // keep the toggle state across the history re-render
 }
+function setCommentary(open){
+  const b = $("#mbody .tog"), c = $("#mbody .cm"); if (!b || !c) return;
+  c.hidden = !open; b.setAttribute("aria-expanded", open); b.textContent = open ? "Hide commentary" : "Show commentary";
+}
+$("#mbody").addEventListener("click", e => { if (e.target.closest(".tog")) setCommentary($("#mbody .cm").hidden); });
+$("#mtitle").addEventListener("click", e => { if (e.target.closest("a.tm-link")) e.stopPropagation(); });
 
 $("#refresh").addEventListener("click", () => load());
 $("#filters").addEventListener("click", e => {
@@ -380,11 +531,16 @@ $("#filters").addEventListener("click", e => {
   filter = b.dataset.f; render();
 });
 $("#list").addEventListener("click", e => {
-  const li = e.target.closest("li.item"); if(li) openPlayer(items[+li.dataset.i]);
+  if (e.target.closest("a.tm-link")){ e.stopPropagation(); return; }   // team link: just open ESPN
+  const li = e.target.closest("li.item"); if(!li) return;
+  if (e.target.closest(".hbtn")){ e.stopPropagation(); const it = items[+li.dataset.i]; markRead(it, li); openPlayer(it); return; }
+  if (e.target.closest(".more") && String(getSelection()).length) return; // selecting commentary text
+  toggleItem(li);
 });
 $("#list").addEventListener("keydown", e => {
-  if(e.key==="Enter"){ const li = e.target.closest("li.item"); if(li) openPlayer(items[+li.dataset.i]); }
+  if(e.key==="Enter" && e.target.matches("li.item")) toggleItem(e.target);
 });
+$("#status").addEventListener("click", e => { if (e.target.id === "markAll") markAllRead(); });
 $("#close").addEventListener("click", () => closeModal());
 $("#modal").addEventListener("click", e => { if(e.target.id==="modal") closeModal(); });
 document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); });

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Fetch NBC Sports NFL player news and write news.json (headlines only, never analysis).
+"""Fetch NBC Sports NFL player news and write news.json.
 
 Run by .github/workflows/fetch-news.yml. Python standard library only.
 Source: https://www.nbcsports.com/fantasy/football/player-news ("All News" view,
 no filter param), first PAGES pages via its own ?p=N pagination.
 For each listed player, their /news page is fetched to build a de-duplicated
-history. A previous news.json (if given) is reused so unchanged players aren't
+history. Each item and history entry also carries "analysis": NBC's commentary
+(.PlayerNewsPost-analysis) as plain text, without the trailing "- Author" credit
+(NBC puts that in its own .PlayerNewsPost-author div, which is dropped). "" if none.
+A previous news.json (if given) is reused so unchanged players aren't
 re-fetched every run.
 
 Rolling window: each run MERGES the fresh posts into the previous news.json's
-items (dedupe key = newsUrl or name + timestamp + headline; the fresh copy wins),
+items (dedupe key = newsUrl or name + timestamp + headline; the fresh copy wins, so
+older items without "analysis" are backfilled when the same post is re-fetched),
 drops anything older than KEEP_DAYS, and sorts newest first (ties broken by key,
 so unchanged input gives byte-identical output and the workflow's
 "skip publish if unchanged" check still works). history keeps only players that
@@ -52,6 +56,21 @@ def attr(chunk, cls, name):
     a = re.search(r'\b%s="([^"]*)"' % re.escape(name), m.group(0))
     return html.unescape(a.group(1)) if a else ""
 
+def analysis(chunk):
+    # Commentary block. It contains a nested author <div>, so walk div depth to find its end.
+    m = re.search(r'<div\b[^>]*class="(?:[^"]*\s)?PlayerNewsPost-analysis(?:\s[^"]*)?"[^>]*>', chunk)
+    if not m: return ""
+    depth, pos = 1, m.end()
+    for t in re.finditer(r'<(/?)div\b[^>]*>', chunk[pos:]):
+        depth += -1 if t.group(1) else 1
+        if depth == 0:
+            body = chunk[pos:pos + t.start()]; break
+    else:
+        body = chunk[pos:]
+    body = re.sub(r'<div\b[^>]*class="[^"]*PlayerNewsPost-author[^"]*"[^>]*>.*?</div>', " ", body, flags=re.S)
+    body = re.sub(r'(?i)<br\s*/?>|</p>', "\n", body)
+    return "\n".join(x for x in (text(l) for l in body.split("\n")) if x)
+
 def parse_date(s):
     try:
         d = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
@@ -79,7 +98,8 @@ def parse_posts(page):
             "name": name,
             "team": inner(chunk, "PlayerNewsPost-team-abbr"),
             "pos": inner(chunk, "PlayerNewsPost-position"),
-            "headline": inner(chunk, "PlayerNewsPost-headline"),   # headline only; -analysis is never read
+            "headline": inner(chunk, "PlayerNewsPost-headline"),
+            "analysis": analysis(chunk),
             "type": inner(chunk, "PlayerNewsPost-type"),
             "date": attr(chunk, "PlayerNewsPost-date", "data-date"),
             "newsUrl": attr(chunk, "PlayerNewsPost-moreNewsLink", "href"),
@@ -127,10 +147,13 @@ def main():
     merged = {}
     for it in (prev_items if isinstance(prev_items, list) else []):
         if isinstance(it, dict) and it.get("headline") and valid_date(it.get("date")):
-            merged[item_key(it)] = {k: it.get(k, "") for k in ("name", "team", "pos", "headline", "type", "date", "newsUrl")}
+            merged[item_key(it)] = {k: it.get(k, "") or "" for k in ("name", "team", "pos", "headline", "analysis", "type", "date", "newsUrl")}
     carried = len(merged)
     for it in fresh:
-        merged[item_key(it)] = it                       # fresh copy wins
+        k = item_key(it); old = merged.get(k)
+        if old and old.get("analysis") and not it.get("analysis"):
+            it = {**it, "analysis": old["analysis"]}   # never lose commentary to a blank re-fetch
+        merged[k] = it                                  # fresh copy wins (backfills analysis)
     items = [it for it in merged.values() if parse_date(it["date"]) >= cutoff]
     items.sort(key=lambda x: (parse_date(x["date"]), item_key(x)), reverse=True)
     items = items[:MAX_ITEMS]
@@ -141,14 +164,16 @@ def main():
         latest = {key(i) for i in fresh if i["newsUrl"] == url}
         old = prev_hist.get(url)
         if old and latest <= {key(h) for h in old}:
-            history[url] = old; reused += 1; continue   # nothing new for this player
+            fa = {key(i): i.get("analysis", "") for i in fresh if i["newsUrl"] == url}
+            history[url] = [{**h, "analysis": h.get("analysis") or fa.get(key(h), "")} for h in old]
+            reused += 1; continue                       # nothing new for this player
         try:
-            hist = [{"headline": h["headline"], "type": h["type"], "date": h["date"]} for h in parse_posts(get(url))]
+            hist = [{"headline": h["headline"], "analysis": h["analysis"], "type": h["type"], "date": h["date"]} for h in parse_posts(get(url))]
             fetched += 1
         except Exception as e:
             print("history ERROR", url, e); errors.append(f"{url}: {e}")
             hist = old or []
-        hist += [{"headline": i["headline"], "type": i["type"], "date": i["date"]}
+        hist += [{"headline": i["headline"], "analysis": i.get("analysis", ""), "type": i["type"], "date": i["date"]}
                  for i in fresh if i["newsUrl"] == url]           # make sure the listed item is included
         dedup = {}
         for h in hist: dedup.setdefault(key(h), h)
