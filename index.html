@@ -52,6 +52,22 @@
   differences: WAS->wsh, JAC->jax, LA->lar (also accepts LAR/JAX/WSH/LVR/OAK/STL/SD aliases);
   all 32 checked against ESPN's own team API. Unknown codes (e.g. FA) aren't linked. Tapping the
   link never expands the item or marks it read.
+  Live Refresh (Settings = gear in the header, a sheet like the player modal; Android Back closes it):
+  the user may paste a GitHub fine-grained token (nfl-bot repo only; Actions: Read and write,
+  Contents: Read-only). It is stored ONLY in this browser's localStorage ("nflbot.ghToken"), shown
+  masked, never logged, never in the repo. Save / Remove / Test (Test = GET .../actions/workflows).
+  With a token, Refresh and pull-to-refresh (same code path: load({live:true})) POST a
+  workflow_dispatch for fetch-news.yml on main, find the new run (runs?event=workflow_dispatch,
+  a run not present before the dispatch and created after it minus 30s skew), poll it every 3s
+  (90s timeout) with "Fetching from NBC… Ns" in the status line, then read news.json via the
+  contents API (?ref=data, Accept: application/vnd.github.raw, authenticated = no raw CDN cache)
+  and merge as usual. The list stays visible throughout; the pull spinner runs until done.
+  401/403 -> "GitHub key invalid or expired — check Settings", then the normal feed load.
+  If the run fails or times out, the feed is still re-read. Only one refresh runs at a time.
+  Without a token (and for the initial page load), the feed order is: contents API (auth if a
+  token is saved, else unauthenticated, 60/hr per IP; when it reports rate-limited we skip it until
+  X-RateLimit-Reset, stored in "nflbot.rlUntil"), then raw.githubusercontent.com (~5 min cache).
+  A one-time hint ("nflbot.tokenHint") tells token-less users that a key enables live refresh.
   Storage errors (private mode, quota) are ignored quietly. All feed text is HTML-escaped.
 -->
 <html lang="en">
@@ -135,6 +151,21 @@
   .sheet h2 a.tm-link{color:inherit}
   .tog{background:none;border:0;padding:6px 0;color:var(--accent);font-size:14px;min-height:32px}
   body.modal-open{overflow:hidden}
+  #gear{background:transparent;border:1px solid var(--line);border-radius:10px;min-width:44px;min-height:44px;font-size:20px;line-height:1;padding:0}
+  #settings{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;justify-content:center;z-index:11;overscroll-behavior:contain}
+  #settings.open{display:flex}
+  #sclose{background:transparent;border:1px solid var(--line);border-radius:10px;min-width:44px;min-height:44px;font-size:18px}
+  #tokIn{width:100%;font:15px/1.3 ui-monospace,monospace;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-height:44px}
+  .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .sbtn{border:1px solid var(--line);background:transparent;border-radius:10px;padding:8px 14px;min-height:44px;font-weight:600}
+  .sbtn.pri{background:var(--accent);border-color:var(--accent)}
+  .sbtn:disabled{opacity:.5}
+  #tokState{font-family:ui-monospace,monospace;font-size:14px;margin:4px 0}
+  #tokMsg{min-height:20px;font-size:14px;margin-top:10px}
+  #tokMsg.ok{color:var(--move)} #tokMsg.err{color:#f87171}
+  .help{color:var(--muted);font-size:13px}
+  .help code{color:var(--text)}
+  #stHint{color:var(--muted)} #stHint button{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:24px}
   /* pull to refresh: a fixed indicator moved with transform only (no layout work per frame) */
   #ptr{position:fixed;left:0;right:0;top:0;z-index:4;height:56px;display:flex;align-items:center;justify-content:center;gap:8px;
     color:var(--muted);font-size:14px;pointer-events:none;transform:translateY(-60px);opacity:0}
@@ -147,11 +178,12 @@
 <body>
 <header id="top">
   <h1>NFL Bot</h1>
+  <button id="gear" type="button" aria-label="Settings" title="Settings">⚙︎</button>
   <button id="refresh" type="button">Refresh</button>
 </header>
 <div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
 <main id="content">
-  <div id="status"><span id="stText">Loading…</span><span id="stRead"></span></div>
+  <div id="status"><span id="stText">Loading…</span><span id="stRead"></span><span id="stHint"></span></div>
   <div class="filters" id="filters">
     <button class="chip on" data-f="all" type="button">All</button>
     <button class="chip" data-f="move" type="button">Roster moves</button>
@@ -167,6 +199,31 @@
   </div>
 </div>
 
+<div id="settings" role="dialog" aria-modal="true" aria-labelledby="stitle">
+  <div class="sheet">
+    <header><h2 id="stitle">Settings</h2><button id="sclose" type="button" aria-label="Close">✕</button></header>
+    <div class="content">
+      <h3>GitHub key (live refresh)</h3>
+      <p class="help">With a key, Refresh asks GitHub to fetch NBC right now (about 15–30 s) instead of reading the last scheduled copy. The key is stored only in this browser on this device.</p>
+      <div id="tokState">No key saved</div>
+      <input id="tokIn" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste github_pat_…" aria-label="GitHub token">
+      <div class="row">
+        <button class="sbtn pri" id="tokSave" type="button">Save</button>
+        <button class="sbtn" id="tokTest" type="button">Test</button>
+        <button class="sbtn" id="tokDel" type="button">Remove</button>
+      </div>
+      <div id="tokMsg" role="status"></div>
+      <h3>How to create one</h3>
+      <ol class="help">
+        <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a> (fine-grained token).</li>
+        <li>Repository access: <b>Only select repositories</b> → <code>nfl-bot</code>.</li>
+        <li>Repository permissions: <b>Actions: Read and write</b>, <b>Contents: Read-only</b> (Metadata: Read-only is added automatically).</li>
+        <li>Generate, copy, paste here, tap Save, then Test.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+
 <script>
 const SOURCE = "https://www.nbcsports.com/fantasy/football/player-news"; // no filter param = the site's "All News" view (not Headline/Injury/Recap/Transaction)
 const PROXIES = [
@@ -174,10 +231,13 @@ const PROXIES = [
   u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
   u => "https://corsproxy.io/?url=" + encodeURIComponent(u)
 ];
-const FEED_URLS = [
-  () => "https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json?t=" + Date.now(),
-  () => "https://api.github.com/repos/PlayDatePlayPass/nfl-bot/contents/news.json?ref=data&t=" + Date.now()
-];
+const API = "https://api.github.com/repos/PlayDatePlayPass/nfl-bot";
+const RAW_URL = () => "https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/news.json?t=" + Date.now();
+const CONTENTS_URL = () => API + "/contents/news.json?ref=data&t=" + Date.now();
+const WF = API + "/actions/workflows/fetch-news.yml";
+const TOKEN_KEY = "nflbot.ghToken";   // GitHub token: this browser's localStorage only, never logged
+const RL_KEY = "nflbot.rlUntil";      // unauthenticated contents API rate-limited until (ms)
+const HINT_KEY = "nflbot.tokenHint";  // one-time "add a key" hint shown
 const LAST_KEY = "nflbot.lastRefresh";
 const CACHE_KEY = "nflbot.cache";      // rolling list of real (never demo) items: {v:1, items:[...]}
 const KEEP_MS = 7 * 86400e3;           // 7-day window
@@ -257,23 +317,81 @@ async function fetchHtml(url){
   throw lastErr || new Error("fetch failed");
 }
 
+const lsGet = k => { try{ return localStorage.getItem(k); }catch(e){ return null; } };
+const lsSet = (k, v) => { try{ v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); }catch(e){} };
+const getToken = () => (lsGet(TOKEN_KEY) || "").trim();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+class GhAuthError extends Error {}
+
+// GitHub API call (token optional). Throws GhAuthError on 401/403-with-token.
+async function gh(url, {token, method = "GET", body, accept = "application/vnd.github+json", timeout = 10000} = {}){
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeout);
+  const headers = {Accept: accept, "X-GitHub-Api-Version": "2022-11-28"};
+  if (token) headers.Authorization = "Bearer " + token;
+  if (body) headers["Content-Type"] = "application/json";
+  try{
+    const r = await fetch(url, {method, headers, body: body ? JSON.stringify(body) : undefined, signal: ctl.signal, cache: "no-store"});
+    if (token && (r.status === 401 || (r.status === 403 && r.headers.get("x-ratelimit-remaining") !== "0"))) throw new GhAuthError("HTTP " + r.status);
+    return r;
+  } finally { clearTimeout(t); }
+}
+
+const validFeed = d => d && Array.isArray(d.items) && d.items.length && Number.isFinite(Date.parse(d.fetchedAt));
+
 // JSON feed from the GitHub Actions workflow. Returns {fetchedAt, items, history}.
-async function fetchFeed(){
+// Contents API first (no raw CDN cache; skipped while unauthenticated rate-limited), then raw.
+async function fetchFeed(token){
   let lastErr;
-  for (const u of FEED_URLS){
+  const rlUntil = Number(lsGet(RL_KEY)) || 0;
+  if (token || Date.now() >= rlUntil){
     try{
-      const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort(), 10000);
-      const url = u();
-      const r = await fetch(url, {signal: ctl.signal, cache: "no-store",
-        headers: url.includes("api.github.com") ? {Accept: "application/vnd.github.raw+json"} : {}});
-      clearTimeout(t);
-      if(!r.ok) throw new Error("HTTP " + r.status);
+      const r = await gh(CONTENTS_URL(), {token, accept: "application/vnd.github.raw"});
+      if (!token && (r.status === 403 || r.status === 429 || r.headers.get("x-ratelimit-remaining") === "0")){
+        const reset = Number(r.headers.get("x-ratelimit-reset")) * 1000;
+        lsSet(RL_KEY, String(reset > Date.now() ? reset : Date.now() + 15 * 60e3));
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
-      if (!d || !Array.isArray(d.items) || !d.items.length || !Number.isFinite(Date.parse(d.fetchedAt))) throw new Error("bad feed");
+      if (!validFeed(d)) throw new Error("bad feed");
       return d;
-    }catch(e){ lastErr = e; }
+    }catch(e){ if (e instanceof GhAuthError) throw e; lastErr = e; }
   }
+  try{
+    const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort(), 10000);
+    const r = await fetch(RAW_URL(), {signal: ctl.signal, cache: "no-store"}); clearTimeout(t);
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (!validFeed(d)) throw new Error("bad feed");
+    return d;
+  }catch(e){ lastErr = e; }
   throw lastErr || new Error("feed failed");
+}
+
+// Live refresh: dispatch the workflow, wait for its run, then the caller re-reads the feed.
+// progress(text) updates the status line. Returns "done" | "failed" | "timeout".
+async function runWorkflow(token, progress){
+  const t0 = Date.now();
+  const tick = what => progress(what + " " + Math.round((Date.now() - t0) / 1000) + "s");
+  const runsUrl = () => WF + "/runs?event=workflow_dispatch&per_page=5&t=" + Date.now();
+  const listRuns = async () => { const r = await gh(runsUrl(), {token}); if (!r.ok) throw new Error("runs HTTP " + r.status); return (await r.json()).workflow_runs || []; };
+  tick("Asking GitHub to fetch from NBC…");
+  const before = new Set((await listRuns()).map(r => r.id));
+  const sent = Date.now();
+  const d = await gh(WF + "/dispatches", {token, method: "POST", body: {ref: "main"}});
+  if (d.status !== 204 && !d.ok) throw new Error("dispatch HTTP " + d.status);
+  const deadline = t0 + 90e3;
+  let run = null;
+  while (Date.now() < deadline){
+    await sleep(3000);
+    tick("Fetching from NBC…");
+    try{
+      const runs = await listRuns();
+      if (!run) run = runs.find(r => !before.has(r.id) && Date.parse(r.created_at) >= sent - 30e3) || null;
+      else run = runs.find(r => r.id === run.id) || (await (await gh(API + "/actions/runs/" + run.id + "?t=" + Date.now(), {token})).json());
+      if (run && run.status === "completed") return run.conclusion === "success" ? "done" : "failed";
+    }catch(e){ if (e instanceof GhAuthError) throw e; } // transient: keep polling
+  }
+  return "timeout";
 }
 
 const txt = el => el ? el.textContent.replace(/\s+/g," ").trim() : "";
@@ -423,19 +541,38 @@ function toggleItem(li){
   markRead(it, li);
 }
 
+// One refresh at a time: the button, pull-to-refresh and startup all go through load().
+// opts.live = user-initiated refresh (dispatches the workflow when a token is saved).
 let loading = null;
-function load(){ return loading || (loading = doLoad().finally(() => { loading = null; })); }
+function load(opts){ return loading || (loading = doLoad(opts || {}).finally(() => { loading = null; })); }
 
-async function doLoad(){
+async function doLoad({live: wantLive = false} = {}){
   const btn = $("#refresh"), st = $("#status");
   const stx = $("#stText");
   btn.disabled = true; st.className = ""; stx.textContent = "Loading latest from NBC Sports…"; $("#stRead").innerHTML = "";
-  let raw = null, asOf = null, live = false;
+  let raw = null, asOf = null, live = false, note = "", token = getToken();
+  if (token && wantLive){
+    try{
+      const res = await runWorkflow(token, s => { stx.textContent = s; });
+      if (res === "failed") note = "GitHub fetch run failed · ";
+      else if (res === "timeout") note = "GitHub fetch still running after 90s · ";
+      stx.textContent = "Loading fresh news…";
+    }catch(e){
+      if (e instanceof GhAuthError){ note = "GitHub key invalid or expired — check Settings · "; token = ""; }
+      else note = "Live refresh failed · ";
+    }
+  }
   try{
-    feed = await fetchFeed(); raw = feed.items; asOf = Date.parse(feed.fetchedAt); live = true;
+    feed = await fetchFeed(token); raw = feed.items; asOf = Date.parse(feed.fetchedAt); live = true;
   }catch(e){
-    feed = null;
-    try{ raw = parsePosts(await fetchHtml(SOURCE)); live = true; }catch(e2){} // secondary: live via CORS proxies
+    if (e instanceof GhAuthError){
+      note = "GitHub key invalid or expired — check Settings · ";
+      try{ feed = await fetchFeed(""); raw = feed.items; asOf = Date.parse(feed.fetchedAt); live = true; }catch(e3){}
+    }
+    if (!live){
+      feed = null;
+      try{ raw = parsePosts(await fetchHtml(SOURCE)); live = true; }catch(e2){} // secondary: live via CORS proxies
+    }
   }
   const prep = arr => stamp(arr).map(i => ({...i, k: kind(i)})).filter(i => i.k);
   const now = Date.now();
@@ -474,7 +611,17 @@ async function doLoad(){
       ? "Live from NBC Sports · data as of " + when(asOf) + tail
       : "Live from NBC Sports (direct) · updated " + new Date(now).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) + tail;
   }
+  if (note) stx.textContent = note + stx.textContent;
+  renderHint(wantLive && !getToken() && !isDemo);
   render(); renderReadStatus(); btn.disabled = false;
+}
+
+// One-time subtle hint for token-less users (shown on their first manual refresh).
+function renderHint(show){
+  const el = $("#stHint");
+  if (!show || lsGet(HINT_KEY)){ el.innerHTML = ""; return; }
+  lsSet(HINT_KEY, "1");
+  el.innerHTML = ' · Tip: a GitHub key makes Refresh fetch live <button type="button" id="hintOpen">Settings</button>';
 }
 
 // Modal. Android back button closes it via a history entry.
@@ -484,7 +631,57 @@ function closeModal(fromPop){
   $("#modal").classList.remove("open"); document.body.classList.remove("modal-open");
   if (modalHist && !fromPop){ modalHist = false; history.back(); } else modalHist = false;
 }
-window.addEventListener("popstate", () => closeModal(true));
+window.addEventListener("popstate", () => { if (settingsOpen()) closeSettings(true); else closeModal(true); });
+
+// Settings sheet (token). Same Back-button behavior as the modal.
+let setHist = false;
+const settingsOpen = () => $("#settings").classList.contains("open");
+const mask = t => t.length <= 8 ? "••••" : t.slice(0, 11 > t.length - 4 ? 4 : 11) + "…" + "•".repeat(6) + t.slice(-4);
+function showTok(msg, cls){ const m = $("#tokMsg"); m.textContent = msg || ""; m.className = cls || ""; }
+function renderTok(){
+  const t = getToken();
+  $("#tokState").textContent = t ? "Saved: " + mask(t) : "No key saved";
+  $("#tokDel").disabled = !t; $("#tokTest").disabled = !t && !$("#tokIn").value.trim();
+}
+function openSettings(){
+  if (settingsOpen()) return;
+  $("#tokIn").value = ""; showTok(""); renderTok();
+  $("#settings").classList.add("open"); document.body.classList.add("modal-open");
+  try{ history.pushState({nflSettings:1}, ""); setHist = true; }catch(e){}
+}
+function closeSettings(fromPop){
+  if (!settingsOpen()) return;
+  $("#settings").classList.remove("open");
+  if (!$("#modal").classList.contains("open")) document.body.classList.remove("modal-open");
+  $("#tokIn").value = "";
+  if (setHist && !fromPop){ setHist = false; history.back(); } else setHist = false;
+}
+async function testToken(){
+  const t = $("#tokIn").value.trim() || getToken();
+  if (!t){ showTok("Paste a key first.", "err"); return; }
+  showTok("Testing…"); $("#tokTest").disabled = true;
+  try{
+    const r = await gh(API + "/actions/workflows", {token: t});
+    if (r.ok){ const d = await r.json(); showTok("OK · key works (" + (d.total_count ?? 0) + " workflows visible)", "ok"); }
+    else showTok("Error: HTTP " + r.status + (r.status === 404 ? " (no access to nfl-bot)" : ""), "err");
+  }catch(e){
+    showTok(e instanceof GhAuthError ? "Error: " + e.message + " — key invalid, expired, or missing Actions permission" : "Error: " + (e.name === "AbortError" ? "timed out" : "network error"), "err");
+  }
+  renderTok();
+}
+$("#gear").addEventListener("click", openSettings);
+$("#sclose").addEventListener("click", () => closeSettings());
+$("#settings").addEventListener("click", e => { if (e.target.id === "settings") closeSettings(); });
+$("#tokIn").addEventListener("input", renderTok);
+$("#tokSave").addEventListener("click", () => {
+  const t = $("#tokIn").value.trim();
+  if (!t){ showTok("Paste a key first.", "err"); return; }
+  if (/\s/.test(t)){ showTok("That doesn't look like a token (contains spaces).", "err"); return; }
+  lsSet(TOKEN_KEY, t); $("#tokIn").value = "";
+  showTok(getToken() === t ? "Saved on this device." : "Couldn't save (storage blocked).", getToken() === t ? "ok" : "err"); renderTok();
+});
+$("#tokDel").addEventListener("click", () => { lsSet(TOKEN_KEY, null); $("#tokIn").value = ""; showTok("Key removed.", "ok"); renderTok(); });
+$("#tokTest").addEventListener("click", testToken);
 
 let openToken = 0;
 async function openPlayer(it){
@@ -524,7 +721,7 @@ function setCommentary(open){
 $("#mbody").addEventListener("click", e => { if (e.target.closest(".tog")) setCommentary($("#mbody .cm").hidden); });
 $("#mtitle").addEventListener("click", e => { if (e.target.closest("a.tm-link")) e.stopPropagation(); });
 
-$("#refresh").addEventListener("click", () => load());
+$("#refresh").addEventListener("click", () => load({live: true}));
 $("#filters").addEventListener("click", e => {
   const b = e.target.closest(".chip"); if(!b) return;
   document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c===b));
@@ -540,10 +737,10 @@ $("#list").addEventListener("click", e => {
 $("#list").addEventListener("keydown", e => {
   if(e.key==="Enter" && e.target.matches("li.item")) toggleItem(e.target);
 });
-$("#status").addEventListener("click", e => { if (e.target.id === "markAll") markAllRead(); });
+$("#status").addEventListener("click", e => { if (e.target.id === "markAll") markAllRead(); else if (e.target.id === "hintOpen") openSettings(); });
 $("#close").addEventListener("click", () => closeModal());
 $("#modal").addEventListener("click", e => { if(e.target.id==="modal") closeModal(); });
-document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); });
+document.addEventListener("keydown", e => { if(e.key==="Escape"){ if (settingsOpen()) closeSettings(); else closeModal(); } });
 
 // Pull to refresh: drag down from the top of the page to reload.
 // Only transform/opacity change per frame (compositor-only), updates are rAF-throttled,
@@ -587,7 +784,7 @@ document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); }
     startY = null; decided = false; setAnim(true);
     if (trigger && dist >= THRESHOLD && !$("#refresh").disabled){
       busy = true; ptr.classList.add("loading"); spin.style.transform = ""; label.textContent = "Refreshing…"; set(REST);
-      await load();
+      await load({live: true});
       ptr.classList.remove("loading"); busy = false;
     }
     label.textContent = "Pull to refresh";
@@ -595,7 +792,7 @@ document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); }
     setTimeout(() => main.classList.remove("pulling"), 220);
   }
   window.addEventListener("touchstart", e => {
-    if (busy || window.scrollY > 0 || e.touches.length > 1 || $("#modal").classList.contains("open") || e.target.closest(".filters")) { startY = null; return; }
+    if (busy || window.scrollY > 0 || e.touches.length > 1 || $("#modal").classList.contains("open") || settingsOpen() || e.target.closest(".filters")) { startY = null; return; }
     startY = e.touches[0].clientY; startX = e.touches[0].clientX; dist = 0; decided = false; setAnim(false);
     if (!armed){ window.addEventListener("touchmove", onMove, {passive: false}); armed = true; }
   }, {passive: true});
