@@ -41,9 +41,11 @@
   commentary under "Latest" behind a "Show commentary" toggle.
   Read/unread: each item's id is the cache dedupe key (keyOf). An item is read when tapped /
   expanded, or scrolled past: >=60% visible for ~1s, or its bottom leaves above the viewport top
-  (IntersectionObserver only, no scroll handlers). Unread rows get an orange dot (#f97316) on the
-  right; the left category marker is a thin bar (green = move, yellow = injury) so the two can't be
-  confused. Read ids live in localStorage ("nflbot.read": {v:1, ids:{id: itemTimeMs}}), pruned to
+  (IntersectionObserver only, no scroll handlers). Unread rows get a white dot (#f1f5f9) on the
+  right; the left category marker is a thin colored bar from color(): blue = transaction,
+  red = out / IR / PUP / NFI / inactive, orange = questionable / doubtful / limited / DNP,
+  green = cleared / full practice / return from IR, purple = suspension, grey = other. Filter
+  chips: Roster moves = blue+purple, Injuries = red+orange+green, grey only under All. Read ids live in localStorage ("nflbot.read": {v:1, ids:{id: itemTimeMs}}), pruned to
   the 7-day window. First visit after this feature (no key yet): every current item is marked
   read, so only later arrivals start unread. "Mark all read" + an unread count sit in the status
   line. Demo items never read or write read state. NEW (since last refresh) is independent.
@@ -80,7 +82,7 @@
 <title>NFL Bot</title>
 <link rel="icon" href="data:,">
 <style>
-  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#facc15;--unread:#f97316;--move:#22c55e;
+  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#facc15;--unread:#f1f5f9;--blue:#3b82f6;--red:#ef4444;--orange:#f97316;--green:#22c55e;--purple:#a855f7;--grey:#64748b;--move:#22c55e;
         --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px);--sar:env(safe-area-inset-right,0px);color-scheme:dark}
   *{box-sizing:border-box}
   /* overscroll-behavior on the root scroller stops Chrome's own pull-to-refresh and glow from fighting ours */
@@ -110,9 +112,14 @@
   li.item{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;cursor:pointer;
     content-visibility:auto;contain-intrinsic-size:auto 96px}
   li.item:active{border-color:var(--accent);background:#1a2029}
-  /* left category marker = thin bar; right unread marker = round orange dot */
+  /* left category marker = thin colored bar; right unread marker = round white dot */
   .dot{flex:0 0 4px;align-self:stretch;min-height:20px;border-radius:2px;background:var(--move)}
-  .dot.injury{background:var(--inj)}
+  .dot.blue{background:var(--blue)}.dot.red{background:var(--red)}.dot.orange{background:var(--orange)}.dot.green{background:var(--green)}.dot.purple{background:var(--purple)}.dot.grey{background:var(--grey)}
+  .ur{box-shadow:0 0 0 2px rgba(241,245,249,.18)}
+  .keybtn{background:none;border:0;color:var(--muted);font-size:13px;text-decoration:underline;padding:6px 4px;min-height:36px;white-space:nowrap}
+  #key{display:none;flex-wrap:wrap;gap:4px 12px;padding:0 calc(var(--sar) + 16px) 8px calc(var(--sal) + 16px);font-size:12px;color:var(--muted)}
+  #key.open{display:flex}
+  #key span::before{content:"";display:inline-block;width:4px;height:12px;border-radius:2px;margin-right:5px;vertical-align:-1px;background:var(--c)}
   .ur{flex:0 0 10px;height:10px;border-radius:50%;margin-top:6px;background:var(--unread);visibility:hidden}
   li.item.unread .ur{visibility:visible}
   li.item.open{content-visibility:visible;border-color:#3a4554}
@@ -188,7 +195,9 @@
     <button class="chip on" data-f="all" type="button">All</button>
     <button class="chip" data-f="move" type="button">Roster moves</button>
     <button class="chip" data-f="injury" type="button">Injuries / designations</button>
+    <button class="keybtn" id="keyBtn" type="button" aria-expanded="false" aria-controls="key">Key</button>
   </div>
+  <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / limited</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
   <ul id="list"></ul>
 </main>
 
@@ -449,6 +458,24 @@ function kind(it){
   return null; // pure analysis or other news: skipped
 }
 
+// Category color (left bar). Most specific rule first; null = not shown (same gate as kind()).
+const C_PURPLE = /\b(suspen\w*|reinstated? from (?:the )?(?:commissioner's )?(?:exempt list|suspension))\b/i;
+const C_RED = /\b((?<!not be )(?:placed?|puts?|moved?)\b[^.]{0,80}?\b(?:on|to) (?:the )?(?:season-ending )?(?:injured reserve|IR|PUP|NFI|reserve\/|physically unable)|ruled? out|rules? out|will not play|won't play|will not suit up|isn't likely to be active|out for|is out|listed as out|declared inactive|inactive|(?<!not be )(?:placed?|put|lands?|landed|heads?|headed|going|goes|moved?|reverts?|reverted) (?:back )?(?:on|to) (?:the )?(?:injured reserve|IR|PUP|NFI|reserve\/(?:PUP|NFI|injured)))\b/i;
+const C_ORANGE = /\b(questionable|doubtful|game-time decision|limited|did not practice|didn't practice|does not practice|will not practice|won't practice|did not participate|not participating|DNP|not practicing|not seen practicing|not seen participating|not spotted at|not on the field|sits? out (?:of )?practice|miss(?:es|ed)? practice|absent from practice)\b/i;
+const C_GREEN = /\b(designated? (?:\w+ )?(?:to|for) return|returns? to practice|resumed? practic\w*|back at practice|activat\w*\b[^.]{0,80}?\b(?:off|from) (?:the )?(?:IR|injured reserve|PUP|NFI|reserve|physically unable|non-football)|no injury designation|without an? injury designation|cleared|(?<!if \S+ (?:\(\w+\) )?)will play|expected to play|good to go|full go|will start|not on (?:the |\w+(?:'s)? )?(?:final )?(?:Week \d+ )?injury report|off the injury report|full(?:y)? practic\w*|practic\w* (?:in )?full|practices? fully|full participant|(?<!in)active for|is active|listed as active)\b/i;
+const C_BLUE = /\b(trade[ds]?|acquire[ds]?|sign(?:s|ed)?|re-sign(?:s|ed)?|release[ds]?|waive[ds]?|claim(?:s|ed)?|cut|practice squad|elevate[ds]?|promote[ds]?|activate[ds]?|retire[ds]?|reinstate[ds]?)\b/i;
+function color(it){
+  if (!kind(it)) return null;
+  const h = (it.headline || "").replace(/[\u2018\u2019]/g, "'");
+  if (C_PURPLE.test(h)) return "purple";
+  if (C_RED.test(h)) return "red";
+  if (C_ORANGE.test(h)) return "orange";
+  if (C_GREEN.test(h)) return "green";
+  if (C_BLUE.test(h) || /transaction|signing|trade/i.test(it.type || "")) return "blue";
+  return "grey";
+}
+const GROUP = {blue:"move", purple:"move", red:"injury", orange:"injury", green:"injury", grey:"other"};
+
 const FMT = new Intl.DateTimeFormat(undefined,{month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
 const when = ms => Number.isFinite(ms) ? FMT.format(ms) : "";
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -469,13 +496,13 @@ const expanded = new Set(); // ids of expanded rows (survives re-render)
 
 function render(){
   const list = $("#list");
-  const shown = filter === "all" ? items : items.filter(i => i.k === filter);
+  const shown = filter === "all" ? items : items.filter(i => GROUP[i.c] === filter);
   if(!shown.length){ list.innerHTML = emptyHtml(); observeUnread(); return; }
   list.innerHTML = shown.map(i => {
     const open = expanded.has(i.id);
     return `
     <li class="item${i.isNew?" is-new":""}${isRead(i)?"":" unread"}${open?" open":""}" data-i="${i.idx}" data-id="${esc(i.id)}" tabindex="0" aria-expanded="${open}">
-      <span class="dot ${i.k==="injury"?"injury":""}"></span>
+      <span class="dot ${i.c||"grey"}"></span>
       <div class="body">
         <div class="who">${esc(i.name)}<span class="tm">${[i.team ? teamHtml(i.team) : "", esc(i.pos||"")].filter(Boolean).join(" · ")}</span>${i.isNew?'<span class="new">NEW</span>':""}</div>
         <div class="hl">${esc(i.headline)}</div>
@@ -574,7 +601,7 @@ async function doLoad({live: wantLive = false} = {}){
       try{ raw = parsePosts(await fetchHtml(SOURCE)); live = true; }catch(e2){} // secondary: live via CORS proxies
     }
   }
-  const prep = arr => stamp(arr).map(i => ({...i, k: kind(i)})).filter(i => i.k);
+  const prep = arr => stamp(arr).map(i => ({...i, k: kind(i), c: color(i)})).filter(i => i.k);
   const now = Date.now();
   const cached = prep(readCache());
   let list;
@@ -723,7 +750,7 @@ $("#mtitle").addEventListener("click", e => { if (e.target.closest("a.tm-link"))
 
 $("#refresh").addEventListener("click", () => load({live: true}));
 $("#filters").addEventListener("click", e => {
-  const b = e.target.closest(".chip"); if(!b) return;
+  const b = e.target.closest(".chip"); if(!b){ if(e.target.id==="keyBtn"){ const o=$("#key").classList.toggle("open"); e.target.setAttribute("aria-expanded",o); } return; }
   document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c===b));
   filter = b.dataset.f; render();
 });
