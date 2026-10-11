@@ -72,8 +72,8 @@
   A one-time hint ("nflbot.tokenHint") tells token-less users that a key enables live refresh.
   Search + team filter: a search field under the header (type=search, enterkeyhint=search, ✕ clear)
   filters live by player name, case/accent-insensitive substring per word ("jeff" -> Justin
-  Jefferson; names pre-normalized once per load), debounced ~120ms. The "Team" select (in the chip
-  row) lists only teams present in the current 7-day items, sorted, with counts, plus "All teams".
+  Jefferson; names pre-normalized once per load), debounced ~120ms. The "Team" select (right of the
+  search field, ~100px) lists only teams present in the current 7-day items, sorted, with counts, plus "All teams".
   Search, team and category chip combine (AND), filtered in memory, list re-rendered. When any is
   active a "Showing N of M · Clear filters" line appears; empty result = "No matches". Team and
   category persist in sessionStorage ("nflbot.filt", stamped with today's date so they don't carry
@@ -190,7 +190,7 @@
   #q::-webkit-search-cancel-button{display:none}
   #qClear{position:absolute;right:2px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--muted);min-width:40px;min-height:40px;font-size:16px}
   #qClear[hidden]{display:none}
-  #teamSel{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 10px;font:14px system-ui,Roboto,sans-serif;min-height:36px;max-width:150px;-webkit-appearance:none;appearance:none}
+  #teamSel{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 8px;font:14px system-ui,Roboto,sans-serif;min-height:42px;flex:0 0 100px;width:100px;min-width:0;text-overflow:ellipsis;-webkit-appearance:none;appearance:none}
   #teamSel.on{background:var(--text);color:var(--bg);border-color:var(--text)}
   #teamSel option{background:var(--card);color:var(--text)}
   #fline{display:none;padding:0 calc(var(--sar) + 16px) 6px calc(var(--sal) + 16px);color:var(--muted);font-size:13px}
@@ -213,13 +213,12 @@
 </header>
 <div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
 <main id="content">
-  <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div></div>
+  <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div><select id="teamSel" aria-label="Team filter"><option value="">Team</option></select></div>
   <div id="status"><span id="stText">Loading…</span><span id="stRead"></span><span id="stHint"></span></div>
   <div class="filters" id="filters">
     <button class="chip on" data-f="all" type="button">All</button>
     <button class="chip" data-f="move" type="button">Roster moves</button>
     <button class="chip" data-f="injury" type="button">Injuries / designations</button>
-    <select id="teamSel" aria-label="Team filter"><option value="">Team</option></select>
     <button class="keybtn" id="keyBtn" type="button" aria-expanded="false" aria-controls="key">Key</button>
   </div>
   <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / unclear</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
