@@ -34,6 +34,16 @@
   feed's fetchedAt (so posts that land between feed updates aren't missed); for the live
   proxy fetch it's the load time. It only advances after a successful feed/live load,
   never for cache or demo. First load (no stored time): nothing is tagged.
+  Status timeline (player modal, under "Latest"): the player's designation changes from the last
+  14 days, oldest -> newest, as a vertical timeline. Sources: feed history (or the proxy-fetched
+  player page) merged with the current/cached list items for that player (same newsUrl, else name),
+  deduped by timestamp + headline. Each entry: dot from color() (grey/unclassified skipped), a short
+  label from statusLabel() (DNP, Limited, Full, Questionable, Doubtful, Out, IR, Activated,
+  Designated to return, Inactive, Cleared, Signed, Released, Traded, Suspended, Unclear, ...),
+  day/time in ET, headline in small text. A one-line trend ("Limited → Questionable → Out", up to 6
+  labels, consecutive repeats collapsed) sits on top. None: "No status changes this week". It
+  renders immediately from list items, then again once history loads. The old "Recent moves &
+  designations" section was removed (same data as the timeline); "Injury history" stays (longer range).
   Commentary: hidden by default. Tapping (or Enter on) a list item expands it inline to show
   the analysis ("No commentary" if none) plus a "Player history" button that opens the player
   modal; tapping again collapses. Expanding only toggles a class and appends one node (no layout
@@ -166,6 +176,14 @@
   .sheet .d{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
   .sheet a{color:var(--accent)}
   .sheet h2 a.tm-link{color:inherit}
+  .tl{list-style:none;margin:4px 0 0;padding:0 0 0 2px}
+  .sheet .tl li{position:relative;margin:0;padding:0 0 10px 20px;border-left:2px solid var(--line);margin-left:5px}
+  .sheet .tl li:last-child{border-left-color:transparent;padding-bottom:0}
+  .tl .td{position:absolute;left:-7px;top:3px;width:12px;height:12px;border-radius:50%;background:var(--grey);border:2px solid var(--card)}
+  .tl .td.blue{background:var(--blue)}.tl .td.red{background:var(--red)}.tl .td.orange{background:var(--orange)}.tl .td.green{background:var(--green)}.tl .td.purple{background:var(--purple)}
+  .tl .lb{font-weight:600}.tl .tw{color:var(--muted);font-size:13px;margin-left:6px;font-variant-numeric:tabular-nums}
+  .tl .th{color:#aab3bf;font-size:13px;line-height:1.35;margin-top:1px}
+  .trend{font-size:14px;font-weight:600;margin:2px 0 8px;overflow-wrap:anywhere}
   .tog{background:none;border:0;padding:6px 0;color:var(--accent);font-size:14px;min-height:32px}
   body.modal-open{overflow:hidden}
   #gear{background:transparent;border:1px solid var(--line);border-radius:10px;min-width:44px;min-height:44px;font-size:20px;line-height:1;padding:0}
@@ -507,6 +525,43 @@ function color(it){
   if (C_GREEN.test(h)) return "green";
   return "grey";
 }
+// Short status label for the timeline. Order: most specific first.
+const LABELS = [
+  [/suspen/i, "Suspended"], [/reinstated/i, "Reinstated"],
+  [/designated? (?:\w+ )?(?:to|for) return|returns? to practice|resumed? practic/i, "Designated to return"],
+  [/activat\w*\b[^.]{0,80}?\b(?:off|from) (?:the )?(?:IR|injured reserve|PUP|NFI|reserve)/i, "Activated"],
+  [/\b(?:injured reserve|IR)\b/, "IR"], [/\bPUP\b|physically unable/i, "PUP"], [/\bNFI\b|non-football/i, "NFI"],
+  [/\btrade[ds]?\b|\bacquire[ds]?\b/i, "Traded"], [/\b(?:release[ds]?|waive[ds]?|cut)\b/i, "Released"],
+  [/\bclaim(?:s|ed)?\b/i, "Claimed"], [/practice squad|elevate/i, "Practice squad"], [/\b(?:re-)?sign(?:s|ed)?\b/i, "Signed"],
+  [/\bactivate/i, "Activated"],
+  [/inactive/i, "Inactive"], [/ruled? out|rules? out|is out|listed as out|out for|will not play|won't play/i, "Out"],
+  [/doubtful/i, "Doubtful"], [/questionable|game-time decision/i, "Questionable"],
+  [/did not practice|didn't practice|does not practice|DNP|not practicing|did not participate|miss(?:es|ed)? practice|sits? out (?:of )?practice/i, "DNP"],
+  [/limited/i, "Limited"],
+  [/full(?:y)? practic|practic\w* (?:in )?full|practices? fully|full participant/i, "Full"],
+  [/cleared|no injury designation|off the injury report|good to go|without an? injury designation/i, "Cleared"],
+  [/will play|expected to play|is active|listed as active|active for|will start/i, "Active"]
+];
+function statusLabel(h, c){
+  h = (h.headline || "").replace(/[\u2018\u2019]/g, "'");
+  if (c === "orange" && C_HEDGE.test(h) && !/questionable|doubtful|limited|did not practice|DNP/i.test(h)) return "Unclear";
+  for (const [re, l] of LABELS) if (re.test(h)) return l;
+  return {blue:"Transaction", red:"Out", orange:"Unclear", green:"Cleared", purple:"Suspended"}[c] || "Update";
+}
+const FMT_ET = new Intl.DateTimeFormat("en-US",{timeZone:"America/New_York",weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+const TL_MS = 14 * 86400e3;
+function timelineHtml(it, hist){
+  const cutoff = Date.now() - TL_MS, m = new Map();
+  const mine = items.filter(i => it.newsUrl ? i.newsUrl === it.newsUrl : i.name === it.name);
+  for (const h of stamp(hist || []).concat(mine)) if (h.t >= cutoff) m.set(h.t + "|" + h.headline, h);
+  const rows = [];
+  for (const h of m.values()){ const c = h.c !== undefined ? h.c : color(h); if (c && c !== "grey") rows.push({h, c, l: statusLabel(h, c)}); }
+  rows.sort((a, b) => a.h.t - b.h.t);
+  if (!rows.length) return '<h3>Status timeline</h3><p class="d">No status changes this week</p>';
+  const trend = rows.map(r => r.l).filter((l, i, a) => l !== a[i - 1]).slice(-6);
+  return `<h3>Status timeline</h3><div class="trend">${esc(trend.join(" → "))}</div><ol class="tl">` +
+    rows.map(r => `<li><span class="td ${r.c}"></span><span class="lb">${esc(r.l)}</span><span class="tw">${esc(FMT_ET.format(r.h.t))} ET</span><div class="th">${esc(r.h.headline)}</div></li>`).join("") + "</ol>";
+}
 const GROUP = {blue:"move", purple:"move", red:"injury", orange:"injury", green:"injury", grey:"other"};
 
 const FMT = new Intl.DateTimeFormat(undefined,{month:"short",day:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
@@ -782,7 +837,7 @@ async function openPlayer(it){
   const body = $("#mbody");
   const latest = `<h3>Latest</h3><p>${esc(it.headline)}<br><span class="d">${esc(when(it.t))}</span></p>` +
     (it.analysis ? `<button class="tog" type="button" aria-expanded="false">Show commentary</button><p class="cm" hidden>${esc(it.analysis)}</p>` : "");
-  body.innerHTML = latest + `<p class="d">Loading player history…</p>`;
+  body.innerHTML = latest + timelineHtml(it, []) + `<p class="d">Loading player history…</p>`;
   body.scrollTop = 0;
   if (!$("#modal").classList.contains("open")){
     $("#modal").classList.add("open"); document.body.classList.add("modal-open");
@@ -797,12 +852,10 @@ async function openPlayer(it){
   if (token !== openToken) return; // a newer modal replaced this one
   hist = stamp(hist).sort((a,b) => b.t - a.t);
   const inj = hist.filter(h => kind(h)==="injury");
-  const recent = hist.filter(h => kind(h)).slice(0,10);
   const li = arr => arr.length ? "<ol>" + arr.map(h => `<li>${esc(h.headline)}<br><span class="d">${esc(when(h.t))}</span></li>`).join("") + "</ol>" : '<p class="d">Nothing listed on the source.</p>';
   const tg = body.querySelector(".tog"), wasOpen = tg && tg.getAttribute("aria-expanded") === "true";
-  body.innerHTML = latest +
+  body.innerHTML = latest + timelineHtml(it, isDemo ? [] : hist) +
     `<h3>Injury history${isDemo?" (demo)":""}</h3>` + li(inj) +
-    `<h3>Recent moves &amp; designations${isDemo?" (demo)":""}</h3>` + li(recent) +
     (it.newsUrl ? `<p><a href="${esc(it.newsUrl)}" target="_blank" rel="noopener">All news on NBC Sports</a></p>` : "");
   if (wasOpen) setCommentary(true); // keep the toggle state across the history re-render
 }
