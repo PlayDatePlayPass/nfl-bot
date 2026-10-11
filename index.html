@@ -43,7 +43,7 @@
   expanded, or scrolled past: >=60% visible for ~1s, or its bottom leaves above the viewport top
   (IntersectionObserver only, no scroll handlers). Unread rows get a white dot (#f1f5f9) on the
   right; the left category marker is a thin colored bar from color(): blue = transaction,
-  red = out / IR / PUP / NFI / inactive, orange = questionable / doubtful / limited / DNP,
+  red = out / IR / PUP / NFI / inactive, orange = questionable / doubtful / limited / DNP / any hedged or unclear availability,
   green = cleared / full practice / return from IR, purple = suspension, grey = other. Filter
   chips: Roster moves = blue+purple, Injuries = red+orange+green, grey only under All. Read ids live in localStorage ("nflbot.read": {v:1, ids:{id: itemTimeMs}}), pruned to
   the 7-day window. First visit after this feature (no key yet): every current item is marked
@@ -197,7 +197,7 @@
     <button class="chip" data-f="injury" type="button">Injuries / designations</button>
     <button class="keybtn" id="keyBtn" type="button" aria-expanded="false" aria-controls="key">Key</button>
   </div>
-  <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / limited</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
+  <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / unclear</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
   <ul id="list"></ul>
 </main>
 
@@ -462,16 +462,24 @@ function kind(it){
 const C_PURPLE = /\b(suspen\w*|reinstated? from (?:the )?(?:commissioner's )?(?:exempt list|suspension))\b/i;
 const C_RED = /\b((?<!not be )(?:placed?|puts?|moved?)\b[^.]{0,80}?\b(?:on|to) (?:the )?(?:season-ending )?(?:injured reserve|IR|PUP|NFI|reserve\/|physically unable)|ruled? out|rules? out|will not play|won't play|will not suit up|isn't likely to be active|out for|is out|listed as out|declared inactive|inactive|(?<!not be )(?:placed?|put|lands?|landed|heads?|headed|going|goes|moved?|reverts?|reverted) (?:back )?(?:on|to) (?:the )?(?:injured reserve|IR|PUP|NFI|reserve\/(?:PUP|NFI|injured)))\b/i;
 const C_ORANGE = /\b(questionable|doubtful|game-time decision|limited|did not practice|didn't practice|does not practice|will not practice|won't practice|did not participate|not participating|DNP|not practicing|not seen practicing|not seen participating|not spotted at|not on the field|sits? out (?:of )?practice|miss(?:es|ed)? practice|absent from practice)\b/i;
-const C_GREEN = /\b(designated? (?:\w+ )?(?:to|for) return|returns? to practice|resumed? practic\w*|back at practice|activat\w*\b[^.]{0,80}?\b(?:off|from) (?:the )?(?:IR|injured reserve|PUP|NFI|reserve|physically unable|non-football)|no injury designation|without an? injury designation|cleared|(?<!if \S+ (?:\(\w+\) )?)will play|expected to play|good to go|full go|will start|not on (?:the |\w+(?:'s)? )?(?:final )?(?:Week \d+ )?injury report|off the injury report|full(?:y)? practic\w*|practic\w* (?:in )?full|practices? fully|full participant|(?<!in)active for|is active|listed as active)\b/i;
+const C_GREEN = /\b(designated? (?:\w+ )?(?:to|for) return|returns? to practice|resumed? practic\w*|back (?:at |practicing)|activat\w*\b[^.]{0,80}?\b(?:off|from) (?:the )?(?:IR|injured reserve|PUP|NFI|reserve|physically unable|non-football)|no injury designation|without an? injury designation|cleared|(?<!if \S+ (?:\(\w+\) )?)will play|expected to play|good to go|full go|will start|not on (?:the |\w+(?:'s)? )?(?:final )?(?:Week \d+ )?injury report|off the injury report|full(?:y)? practic\w*|practic\w* (?:in )?full|practices? fully|full participant|(?<!in)active for|is active|listed as active)\b/i;
+// Hedged/unclear availability (beats green: "does not know if X will play").
+const C_HEDGE = /\b(game-time decision|hopeful|optimistic|likely to (?:miss|play|return|be)|unlikely|expected to miss|(?:real|good|outside|pretty good) chance|added to the injury report|plans? to (?:play|return)|final decision|not (?:yet )?(?:been )?(?:made|determined|decided)|to be determined|uncertain\w*|up in the air|day-to-day|week-to-week|trending|on track|(?:does|did)n't know|(?:does|did) not know|unclear|if|whether|may|might|could|should|hopes? to|questionable|timeline|will miss|miss time|ramp-up|progress\w*|not 100 percent|MRI|surgery|left .{0,40}game|exited|did not return|not seen|not spotted|on the field|sprain\w*|tear|torn|soreness|limp\w*|sling|recover\w*|a chance)\b/i;
+// Anything else about a player's health/availability (body-part tag, injury words) = orange.
+const C_HEALTH = /(\([a-z\/ -]+\)|\b(injur\w*|health\w*|return\w*|availability|play(?:ing)? in Week|ready to play|concussion|protocol|hamstring|ankle|knee|groin|calf|shoulder|toe|ribs?|foot|thumb|illness|elbow|quad|hip|back injury|pec\w*|MCL|ACL|Achilles))/i;
+const C_NONINJ = /\b(retir\w*|extension|restructur\w*|holdout|trade request)\b/i;
 const C_BLUE = /\b(trade[ds]?|acquire[ds]?|sign(?:s|ed)?|re-sign(?:s|ed)?|release[ds]?|waive[ds]?|claim(?:s|ed)?|cut|practice squad|elevate[ds]?|promote[ds]?|activate[ds]?|retire[ds]?|reinstate[ds]?)\b/i;
 function color(it){
   if (!kind(it)) return null;
-  const h = (it.headline || "").replace(/[\u2018\u2019]/g, "'");
+  const h = (it.headline || "").replace(/[\u2018\u2019]/g, "'").replace(/\bwhen asked if\b/gi, "when asked");
   if (C_PURPLE.test(h)) return "purple";
   if (C_RED.test(h)) return "red";
   if (C_ORANGE.test(h)) return "orange";
-  if (C_GREEN.test(h)) return "green";
+  if (C_GREEN.test(h) && !C_HEDGE.test(h)) return "green";
   if (C_BLUE.test(h) || /transaction|signing|trade/i.test(it.type || "")) return "blue";
+  if (C_NONINJ.test(h)) return "grey";
+  if (C_HEDGE.test(h) || C_HEALTH.test(h)) return "orange";
+  if (C_GREEN.test(h)) return "green";
   return "grey";
 }
 const GROUP = {blue:"move", purple:"move", red:"injury", orange:"injury", green:"injury", grey:"other"};
