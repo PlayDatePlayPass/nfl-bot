@@ -70,6 +70,16 @@
   token is saved, else unauthenticated, 60/hr per IP; when it reports rate-limited we skip it until
   X-RateLimit-Reset, stored in "nflbot.rlUntil"), then raw.githubusercontent.com (~5 min cache).
   A one-time hint ("nflbot.tokenHint") tells token-less users that a key enables live refresh.
+  Search + team filter: a search field under the header (type=search, enterkeyhint=search, ✕ clear)
+  filters live by player name, case/accent-insensitive substring per word ("jeff" -> Justin
+  Jefferson; names pre-normalized once per load), debounced ~120ms. The "Team" select (in the chip
+  row) lists only teams present in the current 7-day items, sorted, with counts, plus "All teams".
+  Search, team and category chip combine (AND), filtered in memory, list re-rendered. When any is
+  active a "Showing N of M · Clear filters" line appears; empty result = "No matches". Team and
+  category persist in sessionStorage ("nflbot.filt", stamped with today's date so they don't carry
+  across days); search text is never persisted. The unread count stays total across all items;
+  only rendered (visible) rows can be marked read. Pull-to-refresh never starts while the search
+  field is focused or from a touch on the search bar. The ESPN team link is unchanged.
   Storage errors (private mode, quota) are ignored quietly. All feed text is HTML-escaped.
 -->
 <html lang="en">
@@ -173,6 +183,19 @@
   .help{color:var(--muted);font-size:13px}
   .help code{color:var(--text)}
   #stHint{color:var(--muted)} #stHint button{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:24px}
+  .sbar{display:flex;align-items:center;gap:6px;padding:8px calc(var(--sar) + 16px) 0 calc(var(--sal) + 16px)}
+  .sbar .sw{position:relative;flex:1}
+  #q{width:100%;font:16px/1.2 inherit;font-family:inherit;background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px 40px 9px 12px;min-height:42px;-webkit-appearance:none;appearance:none}
+  #q:focus{outline:none;border-color:var(--accent)}
+  #q::-webkit-search-cancel-button{display:none}
+  #qClear{position:absolute;right:2px;top:50%;transform:translateY(-50%);background:none;border:0;color:var(--muted);min-width:40px;min-height:40px;font-size:16px}
+  #qClear[hidden]{display:none}
+  #teamSel{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 10px;font:14px system-ui,Roboto,sans-serif;min-height:36px;max-width:150px;-webkit-appearance:none;appearance:none}
+  #teamSel.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+  #teamSel option{background:var(--card);color:var(--text)}
+  #fline{display:none;padding:0 calc(var(--sar) + 16px) 6px calc(var(--sal) + 16px);color:var(--muted);font-size:13px}
+  #fline.on{display:block}
+  #fline button{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:28px}
   /* pull to refresh: a fixed indicator moved with transform only (no layout work per frame) */
   #ptr{position:fixed;left:0;right:0;top:0;z-index:4;height:56px;display:flex;align-items:center;justify-content:center;gap:8px;
     color:var(--muted);font-size:14px;pointer-events:none;transform:translateY(-60px);opacity:0}
@@ -190,14 +213,17 @@
 </header>
 <div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
 <main id="content">
+  <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div></div>
   <div id="status"><span id="stText">Loading…</span><span id="stRead"></span><span id="stHint"></span></div>
   <div class="filters" id="filters">
     <button class="chip on" data-f="all" type="button">All</button>
     <button class="chip" data-f="move" type="button">Roster moves</button>
     <button class="chip" data-f="injury" type="button">Injuries / designations</button>
+    <select id="teamSel" aria-label="Team filter"><option value="">Team</option></select>
     <button class="keybtn" id="keyBtn" type="button" aria-expanded="false" aria-controls="key">Key</button>
   </div>
   <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / unclear</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
+  <div id="fline" role="status"></div>
   <ul id="list"></ul>
 </main>
 
@@ -489,6 +515,7 @@ const when = ms => Number.isFinite(ms) ? FMT.format(ms) : "";
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 function emptyHtml(){
+  if (filtersOn()) return '<li class="empty"><strong>No matches</strong>Try a different name, team or category.</li>';
   if (items.length) return '<li class="empty">Nothing in this filter from the last 7 days.</li>';
   return '<li class="empty">No roster moves or designation changes in the last 7 days.</li>';
 }
@@ -502,9 +529,40 @@ const moreHtml = i => `<div class="more">${i.analysis ? `<div class="cm">${esc(i
 const isRead = i => isDemo || !readIds || !!readIds[i.id];
 const expanded = new Set(); // ids of expanded rows (survives re-render)
 
+// Filters: search (q), team, category (filter). AND-combined, in memory.
+let q = "", team = "";
+const norm = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
+const filtersOn = () => !!(q || team || filter !== "all");
+const FILT_KEY = "nflbot.filt", today = () => new Date().toDateString();
+function saveFilt(){ try{ sessionStorage.setItem(FILT_KEY, JSON.stringify({d: today(), team, cat: filter})); }catch(e){} }
+function loadFilt(){
+  try{ const d = JSON.parse(sessionStorage.getItem(FILT_KEY) || "null");
+    if (d && d.d === today()){ team = typeof d.team === "string" ? d.team : ""; if (["all","move","injury"].includes(d.cat)) filter = d.cat; } }catch(e){}
+  document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.f === filter));
+}
+function renderTeams(){
+  const sel = $("#teamSel"), counts = {};
+  for (const i of items) if (i.team) counts[i.team] = (counts[i.team] || 0) + 1;
+  if (team && !counts[team]) counts[team] = 0; // keep a saved choice visible even if it has no items now
+  const teams = Object.keys(counts).sort();
+  sel.innerHTML = `<option value="">${team ? "All teams" : "Team"}</option>` + teams.map(t => `<option value="${esc(t)}">${esc(t)} (${counts[t]})</option>`).join("");
+  sel.value = team; sel.classList.toggle("on", !!team);
+}
+function shownItems(){
+  const words = q ? norm(q).split(/\s+/).filter(Boolean) : [];
+  return items.filter(i => (filter === "all" || GROUP[i.c] === filter) && (!team || i.team === team)
+    && (!words.length || words.every(w => i.nn.includes(w))));
+}
+function renderFline(n){
+  const el = $("#fline");
+  if (!filtersOn()){ el.className = ""; el.innerHTML = ""; return; }
+  el.className = "on"; el.innerHTML = `Showing ${n} of ${items.length} · <button type="button" id="clearF">Clear filters</button>`;
+}
+
 function render(){
   const list = $("#list");
-  const shown = filter === "all" ? items : items.filter(i => GROUP[i.c] === filter);
+  const shown = shownItems();
+  renderFline(shown.length);
   if(!shown.length){ list.innerHTML = emptyHtml(); observeUnread(); return; }
   list.innerHTML = shown.map(i => {
     const open = expanded.has(i.id);
@@ -628,7 +686,7 @@ async function doLoad({live: wantLive = false} = {}){
     isDemo = true;
     list = prep(DEMO.slice()); // demo: never cached, never tagged, never advances the refresh time
   }
-  items = list.map((i, idx) => ({...i, idx, id: keyOf(i), isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
+  items = list.map((i, idx) => ({...i, idx, nn: norm(i.name), id: keyOf(i), isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
   if (!isDemo){
     loadRead();
     if (!readIds){ readIds = {}; for (const i of items) readIds[i.id] = i.t; queueSave(); saveRead(); } // first visit: all read
@@ -648,7 +706,7 @@ async function doLoad({live: wantLive = false} = {}){
   }
   if (note) stx.textContent = note + stx.textContent;
   renderHint(wantLive && !getToken() && !isDemo);
-  render(); renderReadStatus(); btn.disabled = false;
+  renderTeams(); render(); renderReadStatus(); btn.disabled = false;
 }
 
 // One-time subtle hint for token-less users (shown on their first manual refresh).
@@ -760,8 +818,22 @@ $("#refresh").addEventListener("click", () => load({live: true}));
 $("#filters").addEventListener("click", e => {
   const b = e.target.closest(".chip"); if(!b){ if(e.target.id==="keyBtn"){ const o=$("#key").classList.toggle("open"); e.target.setAttribute("aria-expanded",o); } return; }
   document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c===b));
-  filter = b.dataset.f; render();
+  filter = b.dataset.f; saveFilt(); render();
 });
+$("#teamSel").addEventListener("change", e => { team = e.target.value; saveFilt(); renderTeams(); render(); });
+let qTimer = 0;
+$("#q").addEventListener("input", e => {
+  $("#qClear").hidden = !e.target.value;
+  clearTimeout(qTimer); qTimer = setTimeout(() => { const v = e.target.value.trim(); if (v !== q){ q = v; render(); } }, 120);
+});
+$("#q").addEventListener("keydown", e => { if (e.key === "Enter") e.target.blur(); }); // hide the keyboard
+$("#qClear").addEventListener("click", () => { clearTimeout(qTimer); $("#q").value = ""; $("#qClear").hidden = true; q = ""; render(); $("#q").focus(); });
+function clearFilters(){
+  clearTimeout(qTimer); $("#q").value = ""; $("#qClear").hidden = true; q = ""; team = ""; filter = "all";
+  document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.f === "all"));
+  saveFilt(); renderTeams(); render();
+}
+$("#fline").addEventListener("click", e => { if (e.target.id === "clearF") clearFilters(); });
 $("#list").addEventListener("click", e => {
   if (e.target.closest("a.tm-link")){ e.stopPropagation(); return; }   // team link: just open ESPN
   const li = e.target.closest("li.item"); if(!li) return;
@@ -827,7 +899,7 @@ document.addEventListener("keydown", e => { if(e.key==="Escape"){ if (settingsOp
     setTimeout(() => main.classList.remove("pulling"), 220);
   }
   window.addEventListener("touchstart", e => {
-    if (busy || window.scrollY > 0 || e.touches.length > 1 || $("#modal").classList.contains("open") || settingsOpen() || e.target.closest(".filters")) { startY = null; return; }
+    if (busy || window.scrollY > 0 || e.touches.length > 1 || $("#modal").classList.contains("open") || settingsOpen() || e.target.closest(".filters, .sbar") || document.activeElement === $("#q")) { startY = null; return; }
     startY = e.touches[0].clientY; startX = e.touches[0].clientX; dist = 0; decided = false; setAnim(false);
     if (!armed){ window.addEventListener("touchmove", onMove, {passive: false}); armed = true; }
   }, {passive: true});
@@ -836,6 +908,7 @@ document.addEventListener("keydown", e => { if(e.key==="Escape"){ if (settingsOp
   paint();
 })();
 
+loadFilt();
 load();
 </script>
 </body>
