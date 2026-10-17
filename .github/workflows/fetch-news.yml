@@ -72,13 +72,8 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as f: f.write(f"publish={'true' if publish else 'false'}\n")
           PY
 
-      - name: Force-push a single orphan commit to the data branch
+      - name: Publish news.json to the data branch (single orphan commit, keeps rosters.json)
         if: steps.gate.outputs.run == 'true' && steps.diff.outputs.publish == 'true'
-        run: |
-          mkdir out && cp news.json out/ && cd out
-          git init -q -b data
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add news.json
-          git commit -q -m "news.json $(python3 -c 'import json;print(json.load(open("news.json"))["fetchedAt"])')"
-          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data:data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/publish_data.sh "news.json $(python3 -c 'import json;print(json.load(open("news.json"))["fetchedAt"])')" news.json

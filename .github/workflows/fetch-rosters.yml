@@ -1,0 +1,41 @@
+name: Fetch Yahoo rosters
+
+# Daily at 10:17 UTC (6:17 AM ET in summer), plus manual runs.
+# Writes rosters.json (player name, NFL team, position, Dan's fantasy team names) to the
+# data branch next to news.json. Public repo: logs and output carry no tokens, league
+# names or Yahoo ids. Tokens are masked (::add-mask::) by scripts/fetch_rosters.py.
+on:
+  schedule:
+    - cron: '17 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-rosters
+  cancel-in-progress: false
+
+jobs:
+  rosters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Yahoo Fantasy rosters
+        id: fetch
+        env:
+          YAHOO_CLIENT_ID: ${{ secrets.YAHOO_CLIENT_ID }}
+          YAHOO_CLIENT_SECRET: ${{ secrets.YAHOO_CLIENT_SECRET }}
+          YAHOO_REFRESH_TOKEN: ${{ secrets.YAHOO_REFRESH_TOKEN }}
+        run: python3 scripts/fetch_rosters.py rosters.json
+
+      - name: Note refresh-token rotation (no secret written)
+        if: steps.fetch.outputs.refresh_rotated == 'true'
+        run: echo "::warning::Yahoo returned a different refresh token. The YAHOO_REFRESH_TOKEN secret was not updated automatically; the old one normally keeps working. If token refresh starts failing, re-authorize and update the secret."
+
+      - name: Publish rosters.json to the data branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/publish_data.sh "rosters.json $(python3 -c 'import json;print(json.load(open("rosters.json"))["fetchedAt"])')" rosters.json
