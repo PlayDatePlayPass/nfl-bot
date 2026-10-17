@@ -90,6 +90,19 @@
   across days); search text is never persisted. The unread count stays total across all items;
   only rendered (visible) rows can be marked read. Pull-to-refresh never starts while the search
   field is focused or from a touch on the search bar. The ESPN team link is unchanged.
+  My teams (Yahoo Fantasy): .github/workflows/fetch-rosters.yml (daily + manual) runs
+  scripts/fetch_rosters.py, which writes rosters.json to the data branch next to news.json:
+  {fetchedAt, season, teams:[Dan's fantasy team names], players:[{name, team, pos, labels:[team names]}]}.
+  No league names or Yahoo ids. The data branch is public (public repo), so anyone can read it.
+  The app loads it like the feed (contents API with the saved key, else raw), keeps the last good
+  copy in localStorage ("nflbot.roster"), and if it is missing everything below simply stays hidden.
+  Matching (rosterMatch): names normalized (accents stripped, lowercase, "." and "'" removed so
+  A.J. = AJ, other punctuation -> space, Jr/Sr/II/III/IV/V suffixes dropped); team codes aliased
+  (LAR->LA, JAX->JAC, WSH->WAS, LVR->LV). Several roster players with that name -> the one on the
+  item's team. One player with a different NFL team -> rejected (e.g. the other Josh Allen) unless the
+  item is a transaction (blue: traded/signed, Yahoo may lag) or a team is missing/FA.
+  Matching rows show "★ <team names>" after the name; the "★" select right of the Team select
+  filters to all my teams or one team (AND with search/team/category; persisted with the others).
   Storage errors (private mode, quota) are ignored quietly. All feed text is HTML-escaped.
 -->
 <html lang="en">
@@ -211,6 +224,11 @@
   #teamSel{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 8px;font:14px system-ui,Roboto,sans-serif;min-height:42px;flex:0 0 100px;width:100px;min-width:0;text-overflow:ellipsis;-webkit-appearance:none;appearance:none}
   #teamSel.on{background:var(--text);color:var(--bg);border-color:var(--text)}
   #teamSel option{background:var(--card);color:var(--text)}
+  #mineSel{border:1px solid var(--line);background:transparent;color:var(--text);border-radius:999px;padding:6px 8px;font:14px system-ui,Roboto,sans-serif;min-height:42px;flex:0 0 84px;width:84px;min-width:0;text-overflow:ellipsis;-webkit-appearance:none;appearance:none}
+  #mineSel[hidden]{display:none}
+  #mineSel.on{background:var(--inj);color:var(--bg);border-color:var(--inj)}
+  #mineSel option{background:var(--card);color:var(--text)}
+  .mine{display:inline-block;max-width:100%;margin-left:6px;color:var(--inj);font-size:12px;font-weight:600;vertical-align:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #fline{display:none;padding:0 calc(var(--sar) + 16px) 6px calc(var(--sal) + 16px);color:var(--muted);font-size:13px}
   #fline.on{display:block}
   #fline button{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:28px}
@@ -231,7 +249,7 @@
 </header>
 <div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
 <main id="content">
-  <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div><select id="teamSel" aria-label="Team filter"><option value="">Team</option></select></div>
+  <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div><select id="teamSel" aria-label="Team filter"><option value="">Team</option></select><select id="mineSel" aria-label="My fantasy teams filter" hidden><option value="">★</option></select></div>
   <div id="status"><span id="stText">Loading…</span><span id="stRead"></span><span id="stHint"></span></div>
   <div class="filters" id="filters">
     <button class="chip on" data-f="all" type="button">All</button>
@@ -293,6 +311,9 @@ const HINT_KEY = "nflbot.tokenHint";  // one-time "add a key" hint shown
 const LAST_KEY = "nflbot.lastRefresh";
 const CACHE_KEY = "nflbot.cache";      // rolling list of real (never demo) items: {v:1, items:[...]}
 const KEEP_MS = 7 * 86400e3;           // 7-day window
+const ROSTER_KEY = "nflbot.roster";   // last good rosters.json (Dan's fantasy players)
+const ROSTER_RAW = () => "https://raw.githubusercontent.com/PlayDatePlayPass/nfl-bot/data/rosters.json?t=" + Date.now();
+const ROSTER_CONTENTS = () => API + "/contents/rosters.json?ref=data&t=" + Date.now();
 const READ_KEY = "nflbot.read";       // {v:1, ids:{itemId: itemTimeMs}}
 const FIELDS = ["name","team","pos","headline","analysis","type","date","newsUrl"];
 // NBC team code -> ESPN schedule slug (verified against site.api.espn.com team links).
@@ -417,6 +438,45 @@ async function fetchFeed(token){
     return d;
   }catch(e){ lastErr = e; }
   throw lastErr || new Error("feed failed");
+}
+
+// ---- My teams (Yahoo roster) ----
+const TEAM_ALIAS = {LAR:"LA", STL:"LA", JAX:"JAC", WSH:"WAS", LVR:"LV", OAK:"LV", SD:"LAC"};
+const normTeam = t => { t = String(t || "").toUpperCase().trim(); return TEAM_ALIAS[t] || t; };
+const normName = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+  .replace(/[.'\u2019`]/g, "").replace(/[^a-z0-9]+/g, " ").replace(/\b(jr|sr|ii|iii|iv|v)\b/g, " ").replace(/\s+/g, " ").trim();
+let roster = null, rosterIdx = new Map(), mine = "";   // mine: "" | "*" (all my teams) | a team name
+function setRoster(d){
+  if (!d || !Array.isArray(d.players) || !d.players.length) return false;
+  roster = d; rosterIdx = new Map();
+  for (const p of d.players){
+    if (!p || !p.name || !Array.isArray(p.labels)) continue;
+    const k = normName(p.name); if (!k) continue;
+    if (!rosterIdx.has(k)) rosterIdx.set(k, []);
+    rosterIdx.get(k).push({...p, nt: normTeam(p.team)});
+  }
+  return true;
+}
+function rosterMatch(it){
+  const c = rosterIdx.get(normName(it.name)); if (!c) return null;
+  const t = normTeam(it.team);
+  const same = c.filter(p => p.nt && p.nt === t);
+  if (same.length) return same[0];
+  if (c.length > 1) return null;                         // ambiguous name, no team tiebreak
+  const p = c[0];
+  if (!t || t === "FA" || !p.nt || p.nt === "FA" || it.c === "blue") return p;
+  return null;                                            // same name, different NFL team
+}
+async function loadRoster(token){
+  if (!roster){ try{ setRoster(JSON.parse(lsGet(ROSTER_KEY) || "null")); }catch(e){} }
+  const tryJson = async (fn) => { const r = await fn(); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); };
+  let d = null;
+  if (token){ try{ d = await tryJson(() => gh(ROSTER_CONTENTS(), {token, accept: "application/vnd.github.raw"})); }catch(e){} }
+  if (!d){
+    try{ d = await tryJson(async () => { const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 10000);
+      try{ return await fetch(ROSTER_RAW(), {signal: ctl.signal, cache: "no-store"}); } finally { clearTimeout(t); } }); }catch(e){}
+  }
+  if (d && setRoster(d)) lsSet(ROSTER_KEY, JSON.stringify(d));
 }
 
 // Live refresh: dispatch the workflow, wait for its run, then the caller re-reads the feed.
@@ -586,12 +646,12 @@ const expanded = new Set(); // ids of expanded rows (survives re-render)
 // Filters: search (q), team, category (filter). AND-combined, in memory.
 let q = "", team = "";
 const norm = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
-const filtersOn = () => !!(q || team || filter !== "all");
+const filtersOn = () => !!(q || team || mine || filter !== "all");
 const FILT_KEY = "nflbot.filt", today = () => new Date().toDateString();
-function saveFilt(){ try{ sessionStorage.setItem(FILT_KEY, JSON.stringify({d: today(), team, cat: filter})); }catch(e){} }
+function saveFilt(){ try{ sessionStorage.setItem(FILT_KEY, JSON.stringify({d: today(), team, mine, cat: filter})); }catch(e){} }
 function loadFilt(){
   try{ const d = JSON.parse(sessionStorage.getItem(FILT_KEY) || "null");
-    if (d && d.d === today()){ team = typeof d.team === "string" ? d.team : ""; if (["all","move","injury"].includes(d.cat)) filter = d.cat; } }catch(e){}
+    if (d && d.d === today()){ team = typeof d.team === "string" ? d.team : ""; mine = typeof d.mine === "string" ? d.mine : ""; if (["all","move","injury"].includes(d.cat)) filter = d.cat; } }catch(e){}
   document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.f === filter));
 }
 function renderTeams(){
@@ -602,9 +662,19 @@ function renderTeams(){
   sel.innerHTML = `<option value="">${team ? "All teams" : "Team"}</option>` + teams.map(t => `<option value="${esc(t)}">${esc(t)} (${counts[t]})</option>`).join("");
   sel.value = team; sel.classList.toggle("on", !!team);
 }
+function renderMine(){
+  const sel = $("#mineSel"), names = roster && Array.isArray(roster.teams) ? roster.teams.filter(n => typeof n === "string") : [];
+  if (!names.length || isDemo){ sel.hidden = true; if (mine){ mine = ""; } return; }
+  if (mine && mine !== "*" && !names.includes(mine)) mine = "";
+  const cnt = n => items.reduce((a, i) => a + (i.my && (n === "*" || i.my.includes(n)) ? 1 : 0), 0);
+  sel.innerHTML = `<option value="">${mine ? "★ All players" : "★"}</option><option value="*">★ My teams (${cnt("*")})</option>`
+    + names.map(n => `<option value="${esc(n)}">★ ${esc(n)} (${cnt(n)})</option>`).join("");
+  sel.value = mine; sel.hidden = false; sel.classList.toggle("on", !!mine);
+}
 function shownItems(){
   const words = q ? norm(q).split(/\s+/).filter(Boolean) : [];
   return items.filter(i => (filter === "all" || GROUP[i.c] === filter) && (!team || i.team === team)
+    && (!mine || (i.my && (mine === "*" || i.my.includes(mine))))
     && (!words.length || words.every(w => i.nn.includes(w))));
 }
 function renderFline(n){
@@ -621,10 +691,10 @@ function render(){
   list.innerHTML = shown.map(i => {
     const open = expanded.has(i.id);
     return `
-    <li class="item${i.isNew?" is-new":""}${isRead(i)?"":" unread"}${open?" open":""}" data-i="${i.idx}" data-id="${esc(i.id)}" tabindex="0" aria-expanded="${open}">
+    <li class="item${i.my?" my":""}${i.isNew?" is-new":""}${isRead(i)?"":" unread"}${open?" open":""}" data-i="${i.idx}" data-id="${esc(i.id)}" tabindex="0" aria-expanded="${open}">
       <span class="dot ${i.c||"grey"}"></span>
       <div class="body">
-        <div class="who">${esc(i.name)}<span class="tm">${[i.team ? teamHtml(i.team) : "", esc(i.pos||"")].filter(Boolean).join(" · ")}</span>${i.isNew?'<span class="new">NEW</span>':""}</div>
+        <div class="who">${esc(i.name)}<span class="tm">${[i.team ? teamHtml(i.team) : "", esc(i.pos||"")].filter(Boolean).join(" · ")}</span>${i.isNew?'<span class="new">NEW</span>':""}${i.my?`<span class="mine" title="${esc(i.my.join(", "))}">★ ${esc(i.my.join(" · "))}</span>`:""}</div>
         <div class="hl">${esc(i.headline)}</div>
         <div class="when">${esc(when(i.t))}</div>${open ? moreHtml(i) : ""}
       </div>
@@ -698,6 +768,7 @@ async function doLoad({live: wantLive = false} = {}){
   const stx = $("#stText");
   btn.disabled = true; st.className = ""; stx.textContent = "Loading latest from NBC Sports…"; $("#stRead").innerHTML = "";
   let raw = null, asOf = null, live = false, note = "", token = getToken();
+  const rosterP = loadRoster(token).catch(() => {});
   if (token && wantLive){
     try{
       const res = await runWorkflow(token, s => { stx.textContent = s; });
@@ -740,7 +811,9 @@ async function doLoad({live: wantLive = false} = {}){
     isDemo = true;
     list = prep(DEMO.slice()); // demo: never cached, never tagged, never advances the refresh time
   }
+  await rosterP;
   items = list.map((i, idx) => ({...i, idx, nn: norm(i.name), id: keyOf(i), isNew: !isDemo && !!prevRefresh && i.t > prevRefresh}));
+  for (const i of items){ const p = isDemo ? null : rosterMatch(i); i.my = p ? p.labels : null; }
   if (!isDemo){
     loadRead();
     if (!readIds){ readIds = {}; for (const i of items) readIds[i.id] = i.t; queueSave(); saveRead(); } // first visit: all read
@@ -760,7 +833,7 @@ async function doLoad({live: wantLive = false} = {}){
   }
   if (note) stx.textContent = note + stx.textContent;
   renderHint(wantLive && !getToken() && !isDemo);
-  renderTeams(); render(); renderReadStatus(); btn.disabled = false;
+  renderTeams(); renderMine(); render(); renderReadStatus(); btn.disabled = false;
 }
 
 // One-time subtle hint for token-less users (shown on their first manual refresh).
@@ -833,7 +906,7 @@ $("#tokTest").addEventListener("click", testToken);
 let openToken = 0;
 async function openPlayer(it){
   const token = ++openToken;
-  $("#mtitle").innerHTML = esc(it.name) + (it.team ? " · " + teamHtml(it.team) : "");
+  $("#mtitle").innerHTML = esc(it.name) + (it.team ? " · " + teamHtml(it.team) : "") + (it.my ? `<span class="mine">★ ${esc(it.my.join(" · "))}</span>` : "");
   const body = $("#mbody");
   const latest = `<h3>Latest</h3><p>${esc(it.headline)}<br><span class="d">${esc(when(it.t))}</span></p>` +
     (it.analysis ? `<button class="tog" type="button" aria-expanded="false">Show commentary</button><p class="cm" hidden>${esc(it.analysis)}</p>` : "");
@@ -873,6 +946,7 @@ $("#filters").addEventListener("click", e => {
   filter = b.dataset.f; saveFilt(); render();
 });
 $("#teamSel").addEventListener("change", e => { team = e.target.value; saveFilt(); renderTeams(); render(); });
+$("#mineSel").addEventListener("change", e => { mine = e.target.value; saveFilt(); renderMine(); render(); });
 let qTimer = 0;
 $("#q").addEventListener("input", e => {
   $("#qClear").hidden = !e.target.value;
@@ -881,9 +955,9 @@ $("#q").addEventListener("input", e => {
 $("#q").addEventListener("keydown", e => { if (e.key === "Enter") e.target.blur(); }); // hide the keyboard
 $("#qClear").addEventListener("click", () => { clearTimeout(qTimer); $("#q").value = ""; $("#qClear").hidden = true; q = ""; render(); $("#q").focus(); });
 function clearFilters(){
-  clearTimeout(qTimer); $("#q").value = ""; $("#qClear").hidden = true; q = ""; team = ""; filter = "all";
+  clearTimeout(qTimer); $("#q").value = ""; $("#qClear").hidden = true; q = ""; team = ""; mine = ""; filter = "all";
   document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.f === "all"));
-  saveFilt(); renderTeams(); render();
+  saveFilt(); renderTeams(); renderMine(); render();
 }
 $("#fline").addEventListener("click", e => { if (e.target.id === "clearF") clearFilters(); });
 $("#list").addEventListener("click", e => {
