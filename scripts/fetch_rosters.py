@@ -44,7 +44,7 @@ def scrub(s):
     s = str(s)
     for v in SECRETS:
         s = s.replace(v, "***")
-    s = re.sub(r"(?i)(bearer\s+|access_token\W+|refresh_token\W+)[A-Za-z0-9._~+/=-]{8,}", r"\1***", s)
+    s = re.sub(r"(?i)(bearer\s+(?!expires)|access_token\W+|refresh_token\W+)[A-Za-z0-9._~+/=-]{8,}", r"\1***", s)
     return s[:300]
 
 def log(*a):
@@ -104,6 +104,17 @@ def yget(at, path, quiet=False):
 
 def debug_variants(at):
     """Called on 401/403: probe a few endpoint variants, statuses only."""
+    parts = at.split(".")
+    if len(parts) == 3:  # JWT-shaped token: print claim NAMES and scope only, never values of ids
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+            log(f"  access token is JWT; claim names={sorted(claims)} scope={claims.get('scope') or claims.get('scp')}")
+        except Exception:
+            log("  access token is JWT-shaped but undecodable")
+    else:
+        log(f"  access token is opaque ({len(parts)} part(s))")
+    st, _, _ = http("https://api.login.yahoo.com/openid/v1/userinfo", headers={"Authorization": "Bearer " + at})
+    log(f"  probe openid userinfo -> HTTP {st}")
     for p in ("/game/nfl", "/users;use_login=1", "/users;use_login=1/games",
               "/users;use_login=1/games;game_keys=nfl/teams?format=json",
               "/users;use_login=1/games;game_codes=nfl;seasons=2026/teams"):
