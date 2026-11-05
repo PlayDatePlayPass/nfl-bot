@@ -50,8 +50,10 @@
   reads); expanded items switch content-visibility to visible. The modal shows the same
   commentary under "Latest" behind a "Show commentary" toggle.
   Read/unread: each item's id is the cache dedupe key (keyOf). An item is read when tapped /
-  expanded, or scrolled past: >=60% visible for ~1s, or its bottom leaves above the viewport top
-  (IntersectionObserver only, no scroll handlers). Unread rows get a white dot (#f1f5f9) on the
+  expanded, or once its top scrolls up to (or under) the bottom edge of the sticky #top block
+  (header + search + status + filter chips); rows that never get there are read when the page
+  is scrolled all the way to the bottom (passive rAF-throttled scroll listener). Accent color
+  (Refresh, NEW tags, links) is rose red #e11d48, distinct from the #ef4444 Out/IR stripe. Unread rows get a white dot (#f1f5f9) on the
   right; the left category marker is a thin colored bar from color(): blue = transaction,
   red = out / IR / PUP / NFI / inactive, orange = questionable / doubtful / limited / DNP / any hedged or unclear availability,
   green = cleared / full practice / return from IR, purple = suspension, grey = other. Filter
@@ -115,7 +117,7 @@
 <title>NFL Bot</title>
 <link rel="icon" href="data:,">
 <style>
-  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#3b82f6;--inj:#facc15;--unread:#f1f5f9;--blue:#3b82f6;--red:#ef4444;--orange:#f97316;--green:#22c55e;--purple:#a855f7;--grey:#64748b;--move:#22c55e;
+  :root{--bg:#0b0d10;--card:#151a21;--line:#262d38;--text:#e9edf2;--muted:#8b95a3;--accent:#e11d48;--accent-soft:rgba(225,29,72,.18);--accent-text:#fda4af;--inj:#facc15;--unread:#f1f5f9;--blue:#3b82f6;--red:#ef4444;--orange:#f97316;--green:#22c55e;--purple:#a855f7;--grey:#64748b;--move:#22c55e;
         --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);--sal:env(safe-area-inset-left,0px);--sar:env(safe-area-inset-right,0px);color-scheme:dark}
   *{box-sizing:border-box}
   /* overscroll-behavior on the root scroller stops Chrome's own pull-to-refresh and glow from fighting ours */
@@ -125,11 +127,12 @@
     text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased}
   body{overscroll-behavior-y:none;min-height:100vh;min-height:100dvh}
   button,li.item{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
-  header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);
-    padding:calc(var(--sat) + 12px) calc(var(--sar) + 16px) 12px calc(var(--sal) + 16px);display:flex;align-items:center;gap:12px}
+  /* sticky block: header (refresh row) + search + status + filter chips + key; only #list scrolls under it */
+  #top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+  #top > header{padding:calc(var(--sat) + 12px) calc(var(--sar) + 16px) 12px calc(var(--sal) + 16px);display:flex;align-items:center;gap:12px}
   h1{font-size:20px;margin:0;flex:1}
   button{font:inherit;color:inherit}
-  #refresh{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:600;min-height:44px}
+  #refresh{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:600;min-height:44px}
   #refresh:active{filter:brightness(.88)}
   #refresh:disabled{opacity:.5}
   main{will-change:auto}
@@ -141,10 +144,10 @@
   .filters::-webkit-scrollbar{display:none}
   .chip{border:1px solid var(--line);background:transparent;border-radius:999px;padding:6px 12px;font-size:14px;white-space:nowrap;min-height:36px}
   .chip.on{background:var(--text);color:var(--bg);border-color:var(--text)}
-  ul#list{list-style:none;margin:0;padding:0 calc(var(--sar) + 12px) calc(var(--sab) + 24px) calc(var(--sal) + 12px)}
+  ul#list{list-style:none;margin:0;padding:4px calc(var(--sar) + 12px) calc(var(--sab) + 24px) calc(var(--sal) + 12px)}
   li.item{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;cursor:pointer;
     content-visibility:auto;contain-intrinsic-size:auto 96px}
-  li.item:active{border-color:var(--accent);background:#1a2029}
+  li.item:active{border-color:#4b5563;background:#1a2029}
   /* left category marker = thin colored bar; right unread marker = round white dot */
   .dot{flex:0 0 4px;align-self:stretch;min-height:20px;border-radius:2px;background:var(--move)}
   .dot.blue{background:var(--blue)}.dot.red{background:var(--red)}.dot.orange{background:var(--orange)}.dot.green{background:var(--green)}.dot.purple{background:var(--purple)}.dot.grey{background:var(--grey)}
@@ -165,13 +168,13 @@
   #status .mark{background:none;border:0;padding:0 4px;color:var(--accent);font-size:13px;text-decoration:underline;min-height:24px}
   #status .uc{color:var(--unread);font-weight:600}
   .body{flex:1;min-width:0;overflow-wrap:anywhere}
-  .who{font-weight:700}
+  .who{font-weight:700;font-size:18.5px;line-height:1.3}
   .who .tm{color:var(--muted);font-weight:500;font-size:14px;margin-left:4px}
   .hl{margin-top:2px}
   .when{color:var(--muted);font-size:13px;margin-top:4px;font-variant-numeric:tabular-nums}
-  li.item.is-new{border-color:#2b4f86}
-  .new{display:inline-block;vertical-align:2px;margin-left:8px;padding:1px 6px;border-radius:6px;background:rgba(59,130,246,.18);
-    border:1px solid var(--accent);color:#93c5fd;font-size:11px;font-weight:700;letter-spacing:.06em;line-height:1.4}
+  li.item.is-new{border-color:#4b5563}
+  .new{display:inline-block;vertical-align:2px;margin-left:8px;padding:1px 6px;border-radius:6px;background:var(--accent-soft);
+    border:1px solid var(--accent);color:var(--accent-text);font-size:11px;font-weight:700;letter-spacing:.06em;line-height:1.4}
   .empty{color:var(--muted);text-align:center;padding:40px 16px}
   .empty strong{display:block;color:var(--text);font-weight:600;margin-bottom:4px}
   /* modal */
@@ -242,13 +245,12 @@
 </style>
 </head>
 <body>
-<header id="top">
+<div id="top">
+<header>
   <h1>NFL Bot</h1>
   <button id="gear" type="button" aria-label="Settings" title="Settings">⚙︎</button>
   <button id="refresh" type="button">Refresh</button>
 </header>
-<div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
-<main id="content">
   <div class="sbar" id="sbar"><div class="sw"><input id="q" type="search" enterkeyhint="search" inputmode="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Search players" aria-label="Search players"><button id="qClear" type="button" aria-label="Clear search" hidden>✕</button></div><select id="teamSel" aria-label="Team filter"><option value="">Team</option></select><select id="mineSel" aria-label="My fantasy teams filter" hidden><option value="">★</option></select></div>
   <div id="status"><span id="stText">Loading…</span><span id="stRead"></span><span id="stHint"></span></div>
   <div class="filters" id="filters">
@@ -259,6 +261,9 @@
   </div>
   <div id="key" aria-label="Color key"><span style="--c:var(--blue)">Transaction</span><span style="--c:var(--red)">Out / IR / inactive</span><span style="--c:var(--orange)">Questionable / unclear</span><span style="--c:var(--green)">Cleared / full / returning</span><span style="--c:var(--purple)">Suspension</span><span style="--c:var(--grey)">Other</span></div>
   <div id="fline" role="status"></div>
+</div>
+<div id="ptr" aria-live="polite"><span class="spin"></span><span id="ptrText">Pull to refresh</span></div>
+<main id="content">
   <ul id="list"></ul>
 </main>
 
@@ -725,28 +730,25 @@ function markAllRead(){
   renderReadStatus();
 }
 
-// Scrolled-past detection: >=60% visible for 1s, or the row's bottom leaves above the viewport top.
-let io = null;
-const timers = new Map();
-function stopTimer(li){ const t = timers.get(li); if (t){ clearTimeout(t); timers.delete(li); } }
-function observeUnread(){
-  if (io) io.disconnect();
-  timers.forEach(clearTimeout); timers.clear();
-  if (isDemo || !readIds || !("IntersectionObserver" in window)) return;
-  const top = $("#top").offsetHeight; // sticky header hides the top of the viewport
-  io = new IntersectionObserver(entries => {
-    for (const e of entries){
-      const li = e.target, it = items[+li.dataset.i];
-      if (e.intersectionRatio >= 0.6){
-        if (!timers.has(li)) timers.set(li, setTimeout(() => { timers.delete(li); markRead(it, li); }, 1000));
-      } else {
-        stopTimer(li);
-        if (!e.isIntersecting && e.rootBounds && e.boundingClientRect.bottom <= e.rootBounds.top) markRead(it, li);
-      }
-    }
-  }, {rootMargin: `-${top}px 0px 0px 0px`, threshold: [0, 0.6]});
-  document.querySelectorAll("li.item.unread").forEach(li => io.observe(li));
+// Read on scroll: a row is read once its top reaches the bottom edge of the sticky #top block
+// (scrolled up to or under it). Rows that never get there are read when the page is scrolled
+// to the very bottom. Passive, rAF-throttled scroll listener; reads only unread rows' rects.
+let io = null; // kept for markRead/markAllRead compatibility (unused)
+const stopTimer = () => {};
+let readRaf = 0;
+function checkRead(){
+  readRaf = 0;
+  if (isDemo || !readIds) return;
+  const rows = document.querySelectorAll("#list li.item.unread"); if (!rows.length) return;
+  const edge = $("#top").getBoundingClientRect().bottom + 0.5;
+  const se = document.scrollingElement || document.documentElement;
+  const atBottom = window.scrollY > 0 && window.innerHeight + window.scrollY >= se.scrollHeight - 2;
+  for (const li of rows) if (atBottom || li.getBoundingClientRect().top <= edge) markRead(items[+li.dataset.i], li);
 }
+const queueRead = () => { if (!readRaf) readRaf = requestAnimationFrame(checkRead); };
+window.addEventListener("scroll", queueRead, {passive: true});
+window.addEventListener("resize", queueRead, {passive: true});
+function observeUnread(){ queueRead(); }
 
 function toggleItem(li){
   const it = items[+li.dataset.i]; if (!it) return;
